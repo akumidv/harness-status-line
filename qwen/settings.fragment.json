@@ -1,0 +1,11 @@
+{
+  "ui": {
+    "statusLine": {
+      "type": "command",
+      "command": "bash ~/.qwen/statusline-command.sh",
+      "refreshInterval": 30,
+      "respectUserColors": true,
+      "hideContextIndicator": true
+    }
+  }
+}
