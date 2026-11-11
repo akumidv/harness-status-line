@@ -1,0 +1,20 @@
+tui:
+  statusLine:
+    - current-dir
+    - session-title
+    - git-branch
+    - review-link
+    - plan-mode
+    - approval-mode
+    - model-with-reasoning
+    - context-window
+    - subagent
+    - token-quota
+    - context-remaining
+    - custom-command
+  customStatusLine:
+    command: bash -c 'exec bash "$HOME/.minimax/statusline-command.sh"'
+    display: inline
+    colorMode: ansi
+    intervalSeconds: 30
+    timeoutMs: 3000

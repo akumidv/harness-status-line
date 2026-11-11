@@ -1,6 +1,8 @@
 #!/bin/bash
 # Qwen Code status line — the closest match to ~/.claude/statusline-command.sh.
-# Order: model | worktree | context | output speed | session use | git branch | cwd
+# Order: model | worktree | context | mode: work× 🐌spd× time t/s [session] | session use | git branch | cwd
+# The load mode comes from the shared library (~/.local/share/harness-status-line/hsl-lib.sh): the endpoint has no
+# limits, so instead of the limit burn speed it shows spd = how fast the models answer vs their usual speed.
 #
 # Qwen feeds the same shape of JSON on stdin (session_id, model.display_name,
 # context_window, workspace.current_dir, git.branch, worktree.name, metrics) but
@@ -17,6 +19,10 @@ jq_in() { printf '%s' "$input" | jq -r "$1" 2>/dev/null; }
 TAIL_BYTES=4000000
 
 segments=()
+printf -v now '%(%s)T' -1
+HSL_OK=""
+[ -f "$HOME/.local/share/harness-status-line/hsl-lib.sh" ] && . "$HOME/.local/share/harness-status-line/hsl-lib.sh" && HSL_OK=1
+[ -n "$HSL_OK" ] && hsl_kick daily      # collector every 5 min + the daily profile (shared with the other harnesses)
 
 # --- model + reasoning effort ---------------------------------------------
 model=$(jq_in '.model.display_name // empty')
@@ -139,9 +145,21 @@ tps_live=$(jq_in '[.metrics.models // {} | to_entries[] | {o: .value.tokens.comp
     | map(select(.o != null and .l != null and .o > 0 and .l > 0))
     | if length == 0 then empty else ((map(.o) | add) * 1000 / (map(.l) | add) | round) end')
 [ -n "$tps_live" ] && tps_s="$tps_live"
+spd_txt=""
 if [ -n "$tps_w" ] || [ -n "$tps_s" ]; then
-    segments+=("$(printf '\033[33m⚡%s\033[0m \033[2m[%s]\033[0m \033[33mt/s\033[0m' "${tps_w:-–}" "${tps_s:-–}")")
+    spd_txt="$(printf '\033[33m%s\033[0m \033[2m[%s]\033[0m' "${tps_w:-–}" "${tps_s:-–}")"
 fi
+# --- mode block (no limits, so no burn): work× 🐌spd× t/s [session]
+#     speed icon: 🐌 answers slower than usual / ▸ normal / 🐇 faster (all harnesses on the same endpoint)
+mode_ok=""
+if [ -n "$HSL_OK" ]; then
+    hsl_conn qwen "${model// /_}"
+    if [ -n "$REPLY" ] && hsl_seg "$REPLY" "$spd_txt"; then
+        seg=$REPLY; [ -n "$HSL_USE" ] && seg="$seg $(printf '\033[2m·\033[0m') $HSL_USE"
+        segments+=("$seg"); mode_ok=1
+    fi
+fi
+[ -z "$mode_ok" ] && [ -n "$spd_txt" ] && segments+=("$(printf '\033[33m⚡\033[0m')$spd_txt $(printf '\033[33mt/s\033[0m')")
 
 # --- session use: tokens burned + lines changed ---------------------------
 # QWEN: Claude's 5h/weekly rate-limit slots have no analogue here — a gateway

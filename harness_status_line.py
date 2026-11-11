@@ -5,13 +5,14 @@ and deploy them back onto a machine. Never copies whole configs - only the statu
   python3 harness_status_line.py status                 # live vs repo, per harness
   python3 harness_status_line.py extract [--dry-run]    # live config  -> repo   (the collect step)
   python3 harness_status_line.py deploy  [--dry-run]    # repo         -> live config (backs up what it changes)
-  options: --only claude qwen codex mcode (or a profile name such as codex-personal)
+  options: --only shared claude qwen codex mcode (or a profile name such as codex-personal)
 
 Harnesses and what is extracted (see README.md):
-  claude  ~/.claude   statusline-command.sh, statusline-analyze.py, settings.json -> "statusLine"
+  shared  ~/.local/share/harness-status-line   statusline-analyze.py (all harnesses), hsl-lib.sh (bash helpers)
+  claude  ~/.claude   statusline-command.sh, settings.json -> "statusLine"
   qwen    ~/.qwen     statusline-command.sh, settings.json -> "ui.statusLine"
   codex   ~/.codex, ~/.codex-personal   config.toml -> [tui] status_line* keys
-  mcode   ~/.minimax  config.yaml -> tui.statusLine block
+  mcode   ~/.minimax  statusline-command.sh, config.yaml -> tui.statusLine + tui.customStatusLine blocks
 Set HSL_HOME to run against another home directory (testing). Python 3.11+, standard library only.
 """
 from __future__ import annotations
@@ -33,8 +34,10 @@ STAMP = time.strftime('%Y%m%d-%H%M%S')
 
 # name = target (profile) name; harness = repo sub-folder. Repo dir: <harness>/ or <harness>/<name>/ when they differ.
 TARGETS = [
+    dict(name='shared', harness='shared', home='.local/share/harness-status-line',
+         files=['statusline-analyze.py', 'hsl-lib.sh']),
     dict(name='claude', harness='claude', home='.claude',
-         files=['statusline-command.sh', 'statusline-analyze.py'],
+         files=['statusline-command.sh'],
          json=dict(file='settings.json', path=['statusLine'], fragment='settings.fragment.json')),
     dict(name='qwen', harness='qwen', home='.qwen',
          files=['statusline-command.sh'],
@@ -44,7 +47,8 @@ TARGETS = [
     dict(name='codex-personal', harness='codex', home='.codex-personal',
          toml=dict(file='config.toml', table='tui', prefix='status_line', fragment='config.fragment.toml')),
     dict(name='mcode', harness='mcode', home='.minimax',
-         yaml=dict(file='config.yaml', path=['tui', 'statusLine'], fragment='config.fragment.yaml')),
+         files=['statusline-command.sh'],
+         yaml=dict(file='config.yaml', path=['tui'], keys=['statusLine', 'customStatusLine'], fragment='config.fragment.yaml')),
 ]
 
 SECRET_KEY = re.compile(r'(api[_-]?key|token|secret|passw|credential|auth)', re.I)
@@ -176,7 +180,23 @@ def yaml_find(lines, path):
     return rng
 
 
+def yaml_keys(spec):
+    """A yaml spec is either one block (path) or several sibling blocks (path = parent, keys = children)."""
+    return [dict(spec, path=spec['path'] + [k], keys=None) for k in spec['keys']] if spec.get('keys') else [spec]
+
+
 def yaml_fragment(text, spec):
+    if spec.get('keys'):
+        parts = []
+        for sub in yaml_keys(spec):
+            try:
+                parts.append(yaml_fragment(text, sub).split('\n', len(spec['path']))[-1])
+            except Skip:
+                pass
+        if not parts:
+            raise Skip(f'no "{".".join(spec["path"])}.{{{",".join(spec["keys"])}}}" block in live config')
+        head = ''.join('  ' * d + f'{k}:\n' for d, k in enumerate(spec['path']))
+        return head + ''.join(parts)
     lines = text.split('\n')
     rng = yaml_find(lines, spec['path'])
     if rng is None:
@@ -198,7 +218,27 @@ def yaml_fragment(text, spec):
     return frag
 
 
+def yaml_split(fragment, spec):
+    """Multi-key fragment -> [(sub_spec, single-block fragment)]."""
+    n = len(spec['path'])
+    lines = fragment.rstrip('\n').split('\n')
+    head, body = lines[:n], lines[n:]
+    out, cur = [], None
+    for l in body:
+        m = re.match(r'^(\s*)([^\s:#][^:]*):', l)
+        if m and len(m.group(1)) == 2 * n and m.group(2) in spec['keys']:
+            cur = [l]
+            out.append((dict(spec, path=spec['path'] + [m.group(2)], keys=None), cur))
+        elif cur is not None:
+            cur.append(l)
+    return [(sub, '\n'.join(head + blk) + '\n') for sub, blk in out]
+
+
 def yaml_apply(text, spec, fragment):
+    if spec.get('keys'):
+        for sub, frag in yaml_split(fragment, spec):
+            text = yaml_apply(text, sub, frag)
+        return text
     path = spec['path']
     new_block = fragment.rstrip('\n').split('\n')[len(path) - 1:]         # the innermost block, with its indentation
     lines = text.split('\n')
