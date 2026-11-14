@@ -15,7 +15,7 @@ through one endpoint), and its load is a property of the endpoint, not of the ha
 | `free` | no limits, no price (Qwen Code, mcode, free tier) | `work`, speed group | `day Σ3.2M` tokens |
 
 How the billing is decided (first match wins):
-1. Override in `~/.config/harness-status-line/connections.json`: `{"<host>": {"billing": "free|metered|limited"}}`
+1. Override in `~/.local/state/harness-status-line/config.json` (the old `~/.config/harness-status-line/connections.json` is still read when it is missing): `{"<host>": {"billing": "free|metered|limited"}}`
    (no keys or secrets there, only the host and the billing type).
 2. The status line: Claude Code passes `rate_limits` → `limited`. No `rate_limits` (API key, Bedrock, another
    `ANTHROPIC_BASE_URL`) → the load branch of the connection.
@@ -45,7 +45,7 @@ all harnesses: the epoch of the first response in every clock hour, last 26 h.
   the last history sample, which may be older than the 3-hour window when no status line ran (work only in the
   extension) — the expected usage is therefore summed over every active second **from that sample** to now.
 - `free`/`metered`: the collector computes `work` itself: units (tokens or USD) over the current + 2 previous active
-  hours ÷ my usual units **per active hour** (14 days, idle hours excluded; `conn-<host>` line 1, field 6) for those
+  hours ÷ my usual units **per active hour** (14 days, idle hours excluded; `<host>/conn` line 1, field 6) for those
   seconds; pseudo-observation K = 0.1 × that (6 usual minutes). Decided 2026-11-12, replaces the load matrix with the
   `REL_FLOOR` (an hour-of-week matrix averages idle weeks in, so ordinary work read as 2–17×).
 
@@ -98,7 +98,7 @@ mcode:             1.5× 🐌.9× · day Σ528K                (custom-command i
 |---|---|
 | `~/.local/share/harness-status-line/statusline-analyze.py` | the one analyzer (daily + `--collect`) |
 | `~/.local/share/harness-status-line/hsl-lib.sh` | bash helpers sourced by every status line (`hsl_kick`, `hsl_conn`, `hsl_seg`, `hsl_rt`) |
-| `~/.local/state/harness-status-line/conn-<host>` | daily profile: 1 `updated billing coverage unit samples`; 2 load matrix (tokens or USD×10⁴); 3 speed matrix ×100; 4 modes (168 digits); 5 `model=tps`; 6 `fit/prelim/-` |
+| `~/.local/state/harness-status-line/<host>/conn` | daily profile: 1 `updated billing coverage unit samples`; 2 load matrix (tokens or USD×10⁴); 3 speed matrix ×100; 4 modes (168 digits); 5 `model=tps`; 6 `fit/prelim/-` |
 | `~/.local/state/harness-status-line/connections.json` | summary for inspection |
 | `~/.local/state/harness-status-line/collect-state.json` | collector state (Claude transcript offsets, last 26 h) |
 | `/tmp/hsl-$UID/rt-<host>` | `epoch work spd n today unit billing last_response` |

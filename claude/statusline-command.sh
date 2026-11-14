@@ -6,7 +6,7 @@
 # from the shared library (~/.local/share/harness-status-line/hsl-lib.sh), plus today's usage instead of 5h/wk.
 #
 # Cheap by design:
-#  * runtime cache lives in tmpfs (/tmp/claude-sl-UID, RAM); durable data in ~/.claude
+#  * runtime cache lives in tmpfs (/tmp/claude-sl-UID, RAM); durable data in ~/.local/state/harness-status-line/api.anthropic.com (one folder per connection)
 #  * the finished line is cached OUT_TTL seconds per session -> update bursts cost ~1 ms
 #  * the transcript is read incrementally (only bytes added since last time)
 #  * one jq on stdin, everything else is bash arithmetic
@@ -15,10 +15,10 @@ printf -v now '%(%s)T' -1
 E=$'\033'; R="${E}[0m"   # ANSI escape / reset, so segments need no printf subshells
 OUT_TTL=${OUT_TTL:-15}
 
-# --- runtime cache dir (tmpfs); fall back to ~/.claude if /tmp is unusable ---
+# --- runtime cache dir (tmpfs); fall back to ~/.local/state/harness-status-line/cache if /tmp is unusable ---
 RT="/tmp/claude-sl-$UID"
 [ -d "$RT" ] || mkdir -m 700 "$RT" 2>/dev/null
-if [ ! -O "$RT" ] || [ -L "$RT" ]; then RT="$HOME/.claude/.statusline-cache"; mkdir -p "$RT"; fi
+if [ ! -O "$RT" ] || [ -L "$RT" ]; then RT="$HOME/.local/state/harness-status-line/cache"; mkdir -p "$RT"; fi
 CACHE_DIR="$RT"
 
 # --- whole-line cache per session ------------------------------------------
@@ -35,14 +35,18 @@ HSL_OK=""
 [ -f "$HOME/.local/share/harness-status-line/hsl-lib.sh" ] && . "$HOME/.local/share/harness-status-line/hsl-lib.sh" && HSL_OK=1
 [ -n "$HSL_OK" ] && hsl_kick          # collector every 5 min: activity of ALL Claude sessions (VS Code extension too)
 ANALYZER="$HOME/.local/share/harness-status-line/statusline-analyze.py"
-[ -f "$ANALYZER" ] || ANALYZER="$HOME/.claude/statusline-analyze.py"
+# durable data of the Claude account (limits, profile, ...): the folder of its connection (provider) api.anthropic.com
+HSL_ANTH="$HOME/.local/state/harness-status-line/api.anthropic.com"
+[ -d "$HSL_ANTH" ] || mkdir -p "$HSL_ANTH"
 
 # --- schedule constants (UTC) ------------------------------------------------
 # peak = weekdays PEAK_START..PEAK_END; eco = weekends + weekdays before ECO_END; else normal
 PEAK_LAST_DOW=5; PEAK_START=13; PEAK_END=19; ECO_END=8
-HISTORY="$HOME/.claude/.statusline-history"   # LIMIT axis: "epoch wk%x100 5h%x100 weekReset 5hReset", on every whole-% change + 30 min heartbeat, kept forever (durable; token axis = .statusline-tokens)
-PROFILE="$HOME/.claude/.statusline-profile"       # line 2: my load matrix (168 hours of the week, 0.001% of the weekly limit); line 4: burn-speed matrix (168, x100); line 6: fit|prelim; line 7: my use per ACTIVE hour, 0.001% (statusline-analyze.py)
-DAILY="$HOME/.claude/.statusline-daily"       # line1: day stamp; line2: weekly burn pace over 7 days, %/h x100 or "-"
+HISTORY="$HSL_ANTH/history"   # LIMIT axis: "epoch wk%x100 5h%x100 weekReset 5hReset", on every whole-% change + 30 min heartbeat, kept forever (durable; token axis = .statusline-tokens)
+PROFILE="$HSL_ANTH/profile"       # line 2: my load matrix (168 hours of the week, 0.001% of the weekly limit); line 4: burn-speed matrix (168, x100); line 6: fit|prelim; line 7: my use per ACTIVE hour, 0.001% (statusline-analyze.py)
+WKRESET="$HSL_ANTH/wkreset"     # "weekly_reset_epoch epoch wk_x100": the limits were reset by hand inside that weekly window (wk% dropped >= RESET_DROP), possibly only partly (e.g. one model); wk_x100 = the value right after it
+RESET_DROP=300                                   # x100: a wk% drop this big within one weekly window = manual reset (history has 1-point backward steps = noise, ignored)
+DAILY="$HSL_ANTH/daily"       # line1: day stamp; line2: weekly burn pace over 7 days, %/h x100 or "-"
 
 # --- once per UTC day: first run turns the history into a weekly burn pace -----
 days=$(( now / 86400 ))
@@ -52,9 +56,9 @@ if [ "$daily_day" != "$days" ]; then
     find "$CACHE_DIR" -type f -mtime +1 -delete 2>/dev/null
     w_pace="-"
     if [ -f "$HISTORY" ]; then
-        # pace = weekly % consumed over the last 7 days / hours covered (a drop = reset: count the new value)
+        # pace = weekly % consumed over the last 7 days / hours covered (a drop with a new weekly reset time = new week: count the new value; the same reset time = limits reset by hand: nothing used)
         w_pace=$(awk -v now="$now" '
-            $1 >= now-604800 { if (n++) { cons += ($2 >= w0) ? $2-w0 : $2 } else t1 = $1; w0 = $2 }
+            $1 >= now-604800 { if (n++) { cons += ($2 >= w0) ? $2-w0 : ($4 == r0 ? 0 : $2) } else t1 = $1; w0 = $2; r0 = $4 }
             END { span = (now - t1)/3600; if (n > 1 && span >= 24) printf "%d", cons/span + 0.5; else printf "-" }' "$HISTORY")
         [ -z "$w_pace" ] && w_pace="-"
     fi
@@ -266,11 +270,21 @@ fi
 until_next=$(( mn - now ))
 
 # reset times (cheap, also used by the weekly forecast below)
-r5e=""; rwe=""; ew=0
+# wstart = start of the weekly accounting window: the reset - 7d, or a later manual reset of the limits (WKRESET);
+# ew = seconds of it elapsed. Everything "since the weekly reset" below counts from wstart.
+# wbase = the wk% right after that reset (0 after a full one, >0 after a partial one): the use of the week counts above it.
+r5e=""; rwe=""; ew=0; wstart=0; wbase=0; wkr_rw=0; wkr_t=0; wkr_w=0
+[ -f "$WKRESET" ] && read -r wkr_rw wkr_t wkr_w < "$WKRESET"
+case "$wkr_rw$wkr_t${wkr_w:-0}" in ''|*[!0-9]*) wkr_rw=0; wkr_t=0; wkr_w=0 ;; esac
+set_wstart() {
+    ew=0; wbase=0; wstart=$(( rwe - 604800 ))
+    [ "$wkr_rw" = "$rwe" ] && [ "$wkr_t" -gt "$wstart" ] && { wstart=$wkr_t; wbase=${wkr_w:-0}; }
+    [ "$rwe" -gt "$now" ] && ew=$(( now - wstart )); [ "$ew" -lt 0 ] && ew=0
+}
 if [ -n "$five_reset" ]; then to_epoch "$five_reset"; r5e=$REPLY; fi
 if [ -n "$seven_reset" ]; then
     to_epoch "$seven_reset"; rwe=$REPLY
-    [ -n "$rwe" ] && [ "$rwe" -gt "$now" ] && ew=$(( 604800 - (rwe - now) ))
+    [ -n "$rwe" ] && set_wstart
 fi
 
 # history sample: whenever the whole-% of the 5h or weekly limit changes (pins every step to the minute -> best data
@@ -279,6 +293,8 @@ fi
 # VS Code extension, keep working) they stay frozen at its last response. lim_stale = older than 10 min: not written to
 # the history (a frozen wk% would read as "no use") and work falls back to the collector (tokens of all sessions).
 lim_stale=""; [ "${c_epoch:-0}" -gt 0 ] && [ $(( now - c_epoch )) -gt 600 ] && lim_stale=1
+# a response from before a manual reset of the limits carries the old (higher) %: stale, it adopts the shared fresh values instead
+[ "$wkr_rw" = "${rwe:-0}" ] && [ "${c_epoch:-0}" -gt 0 ] && [ "$c_epoch" -lt "$wkr_t" ] && lim_stale=1
 # an expired 5h window (its reset already passed): the % belongs to the previous window -> unknown
 if [ -n "$r5e" ] && [ "$r5e" -le "$now" ]; then five_pct=""; five_x100=""; five_reset=""; r5e=""; fi
 # Fresh limits shared between sessions (same account = same weekly reset): "epoch five_x100 r5e wk_x100 rwe".
@@ -288,6 +304,14 @@ LIM="$CACHE_DIR/lim"
 if [ -n "$seven_x100" ] && [ -n "$rwe" ]; then
     lt=0; l5=""; l5r=""; lw=""; lwr=""; [ -f "$LIM" ] && read -r lt l5 l5r lw lwr < "$LIM"
     case "$lt$lw$lwr" in ''|*[!0-9]*) lt=0 ;; esac; case "$l5$l5r" in ''|*[!0-9]*) l5=""; l5r="" ;; esac
+    # own session idle: the usage poll (statusline-analyze.py --collect -> lim-poll, same format) fills in when it is
+    # newer than the shared one; a fresh own session never looks at it, and without poll data nothing changes
+    if [ -n "$lim_stale" ] && [ -n "$HSL_OK" ] && [ -f "$HSL_RT/lim-poll" ]; then
+        read -r pt p5 p5r pw_ pwr < "$HSL_RT/lim-poll"
+        case "$pt$pw_$pwr" in ''|*[!0-9]*) ;; *)
+            if [ "$pt" -gt "${lt:-0}" ]; then lt=$pt; l5=$p5; l5r=$p5r; lw=$pw_; lwr=$pwr; case "$l5$l5r" in ''|*[!0-9]*) l5=""; l5r="" ;; esac; fi ;;
+        esac
+    fi
     lfresh=""; [ $(( now - ${lt:-0} )) -le 600 ] && [ -n "$lw" ] && lfresh=1
     if [ -z "$lim_stale" ]; then
         p5=${five_x100:--}; p5r=${r5e:--}; pw=$seven_x100
@@ -299,7 +323,7 @@ if [ -n "$seven_x100" ] && [ -n "$rwe" ]; then
         printf '%s %s %s %s %s\n' "$now" "$p5" "$p5r" "$pw" "$rwe" > "$LIM"
     elif [ -n "$lfresh" ] && [ "$lt" -gt "${c_epoch:-0}" ] && { [ "$lwr" = "$rwe" ] || { [ "$rwe" -le "$now" ] && [ "$lwr" -gt "$now" ]; }; }; then
         seven_x100=$lw; seven_pct=$(( (lw + 50) / 100 )); rwe=$lwr; seven_reset=$lwr
-        ew=$(( 604800 - (rwe - now) )); [ "$ew" -lt 0 ] && ew=0
+        set_wstart
         if [ -n "$l5" ] && [ "$l5r" -gt "$now" ]; then
             five_x100=$l5; five_pct=$(( (l5 + 50) / 100 )); r5e=$l5r; five_reset=$l5r
         fi
@@ -313,15 +337,24 @@ if [ -n "$seven_x100" ] && [ -z "$lim_stale" ]; then
     hl=0; hf=""; hw=""; hr=""; hx=0; h5=""; h5r=""
     [ -f "$CACHE_DIR/hist-last" ] && read -r hl hf hw hr hx h5 h5r < "$CACHE_DIR/hist-last"
     case "$hr$hx" in *[!0-9]*) hr=0; hx=0 ;; esac; case "$h5$h5r" in ''|*[!0-9]*) h5=""; h5r="" ;; esac
-    hok=1
-    if [ "${rwe:-0}" -lt "${hr:-0}" ] || { [ "${rwe:-0}" = "$hr" ] && [ "$seven_x100" -lt "${hx:-0}" ]; }; then hok=""; fi
-    if [ -n "$five_x100" ] && [ -n "$r5e" ] && [ -n "$h5r" ]; then
+    hok=1; wk_reset=""
+    if [ "${rwe:-0}" -lt "${hr:-0}" ]; then hok=""
+    elif [ "${rwe:-0}" = "$hr" ] && [ "$seven_x100" -lt "${hx:-0}" ]; then
+        # a fresh response far below the last sample in the same weekly window: the limits were reset by hand
+        if [ $(( hx - seven_x100 )) -ge "$RESET_DROP" ]; then wk_reset=1; else hok=""; fi
+    fi
+    if [ -n "$five_x100" ] && [ -n "$r5e" ] && [ -n "$h5r" ] && [ -z "$wk_reset" ]; then
         if [ "$r5e" -lt "$h5r" ] || { [ "$r5e" = "$h5r" ] && [ "$five_x100" -lt "$h5" ]; }; then hok=""; fi
     fi
     if [ -n "$hok" ]; then
         # an unknown 5h (expired window) is not a change; hist-last keeps the last known 5h for the checks above
         if [ $(( now - ${hl:-0} )) -ge 1800 ] || [ "$seven_pct" != "$hw" ] || { [ -n "$five_pct" ] && [ "$five_pct" != "$hf" ]; }; then
             printf '%s %s %s %s %s\n' "$now" "$seven_x100" "${five_x100:--}" "${rwe:-0}" "${r5e:--}" >> "$HISTORY"
+            if [ -n "$wk_reset" ]; then      # the week now counts from the response that showed it (older responses = stale)
+                wkr_rw=$rwe; wkr_t=$now; wkr_w=$seven_x100; [ "${c_epoch:-0}" -gt 0 ] && wkr_t=$c_epoch
+                printf '%s %s %s\n' "$wkr_rw" "$wkr_t" "$wkr_w" > "$WKRESET"
+                set_wstart
+            fi
             [ -n "$five_x100" ] && [ -n "$r5e" ] && { hf=$five_pct; h5=$five_x100; h5r=$r5e; }
             printf '%s %s %s %s %s %s %s\n' "$now" "${hf:--}" "$seven_pct" "${rwe:-0}" "$seven_x100" "${h5:--}" "${h5r:--}" > "$CACHE_DIR/hist-last"
         fi
@@ -372,7 +405,7 @@ calc_rel() {
     if [ -n "$lim_stale" ] && [ -n "$HSL_OK" ]; then hsl_rt api.anthropic.com; rel=$HSL_REL; return; fi
     load_matrix || return
     h=$(( now / 3600 )); got=0; exp=0; t0=$now
-    wh=$(( (rwe - 604800 + 3599) / 3600 ))                          # first whole hour after the weekly reset: older activity belongs to the previous week
+    wh=$(( (wstart + 3599) / 3600 ))                                # first whole hour after the weekly reset (or the manual one): older activity belongs to the previous week
     # activity of this machine: the status line's own log + the collector's log of ALL sessions (VS Code extension, ...)
     for af in "$CACHE_DIR/act" ${HSL_OK:+"$HSL_RT/act-api.anthropic.com"}; do
         [ -f "$af" ] || continue
@@ -392,7 +425,7 @@ calc_rel() {
     if [ "$got" -ge 120 ] && [ -f "$HISTORY" ]; then
         wk0=""; ts0=""
         while read -r ts w f r _; do
-            [ "${r:-0}" = "$rwe" ] || continue
+            [ "${r:-0}" = "$rwe" ] && [ "$ts" -ge "$wstart" ] || continue     # samples from before a manual reset are another baseline
             [ "$ts" -le "$t0" ] && [ "$ts" -ge $(( t0 - 86400 )) ] && { wk0=$w; ts0=$ts; }   # wk% at the window start = last sample at or before it
         done < <(tail -n 200 "$HISTORY")
         if [ -n "$wk0" ] && [ "$seven_x100" -ge "$wk0" ]; then
@@ -411,9 +444,9 @@ calc_rel() {
         fi
     fi
     exp=0                                                             # week-to-date
-    for (( i = (rwe - 604800) / 3600 + 1; i < h; i++ )); do exp=$(( exp + L[i % 168] * S[i % 168] / 100 )); done
+    for (( i = wstart / 3600 + 1; i < h; i++ )); do exp=$(( exp + L[i % 168] * S[i % 168] / 100 )); done
     exp=$(( exp + L[h % 168] * S[h % 168] / 100 * (now % 3600) / 3600 ))
-    [ "$exp" -ge 1000 ] && rel=$(( (seven_x100 * 10 + K) * 100 / (exp + K) ))
+    [ "$exp" -ge 1000 ] && rel=$(( ((seven_x100 - wbase) * 10 + K) * 100 / (exp + K) ))
 }
 # Burnout epoch of the weekly limit: only the REMAINDER of the matrices is walked (from now to the reset), each hour
 # = load * speed * my pace rel; adds the expected use until the remaining % is gone. bo = epoch, 0 = lasts past
@@ -448,7 +481,7 @@ calc_burn() {
         [ "$el" -ge 600 ] && b_mult=$(( five_x100 * 180 / el ))
     fi
     if [ -n "$seven_x100" ] && [ "$ew" -ge 21600 ]; then
-        mw=$(( seven_x100 * 6048 / ew ))
+        mw=$(( (seven_x100 - wbase) * 6048 / ew ))
         { [ -z "$b_mult" ] || [ "$mw" -gt "$b_mult" ]; } && b_mult=$mw
     fi
 }
@@ -540,7 +573,7 @@ if [ -n "$seven_pct" ]; then
             if [ "$w_pace" -gt 0 ]; then s=$(( w_rem * 3600 / w_pace )); else s=inf; fi
         elif [ "$ew" -ge 1800 ]; then      # no 24h of stats yet: this week's average so far, marked "~"
             approx="~"
-            if [ "$seven_x100" -gt 0 ]; then s=$(( w_rem * ew / seven_x100 )); else s=inf; fi
+            if [ "$seven_x100" -gt "$wbase" ]; then s=$(( w_rem * ew / (seven_x100 - wbase) )); else s=inf; fi
         fi
         if [ -n "$s" ]; then
             if [ "$s" = inf ] || [ "$s" -ge 2592000 ]; then br=${proj_txt:-∞}; approx=""; bcol="${E}[2m"

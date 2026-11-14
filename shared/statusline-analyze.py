@@ -3,10 +3,11 @@
 
 Two kinds of connection (the API endpoint a harness talks to, keyed by host):
   * limited  - a subscription with 5h/weekly limits (Claude Code passes rate_limits): load matrix + burn speed,
-               calibrated to the weekly limit % (the original Claude analysis below, files in ~/.claude);
+               calibrated to the weekly limit % (the original Claude analysis below, files in the connection's folder ~/.local/state/harness-status-line/api.anthropic.com/);
   * free / metered - no limits (own gateway, pay-per-token): load matrix in tokens (free) or USD (metered) and
                a SPEED matrix - how fast the models answer in each hour of the week vs their own median, pooled
-               over models = the load of the endpoint. Files in ~/.local/state/harness-status-line/conn-<host>.
+               over models = the load of the endpoint. Files in ~/.local/state/harness-status-line/<host>/conn.
+Every connection (provider) has its own folder there; harnesses that share an endpoint share its folder.
 Every connection also gets the speed matrix and per-model median speeds (Claude: the colour of the speed).
 
   statusline-analyze.py              daily profile (background, nice 19)
@@ -20,32 +21,52 @@ weights every assistant message by price (per model and token type) and buckets 
 168 hourly slots of a week. The weekly limit % is account-wide, so the absolute scale
 ("% of the weekly limit per USD") is calibrated from this week's cost vs the current wk%.
 
-Writes ~/.claude/.statusline-profile (shell-readable) and .statusline-profile.json (inspection).
+Writes ~/.local/state/harness-status-line/api.anthropic.com/profile (shell-readable) and profile.json (inspection).
 Run in the background once a day by statusline-command.sh. stdlib only.
 usage: statusline-analyze.py [--wk-x100 N --reset EPOCH]   (override calibration, for tests; not persisted)
+       statusline-analyze.py --burn   (read-only report: does the burn rate differ by hour / mode / weekday / day?)
 """
-import collections, datetime, fcntl, glob, json, os, random, re, sys, time
+import bisect, collections, datetime, fcntl, glob, itertools, json, os, random, re, sys, time, urllib.error, urllib.request
 
-CLAUDE = os.path.expanduser('~/.claude')
+CLAUDE = os.path.expanduser('~/.claude')                         # the harness's own dir: transcripts + credentials only, nothing of ours is kept there
 PROJECTS = os.path.join(CLAUDE, 'projects')
-STATE = os.path.join(CLAUDE, '.statusline-analyze-state.json')
-OUT = os.path.join(CLAUDE, '.statusline-profile')
-MEASURES = os.path.join(CLAUDE, '.statusline-measures.jsonl')   # one record per completed UTC day (long-term log)
+HOME = os.path.expanduser('~')
+HSL_STATE = os.path.join(HOME, '.local/state/harness-status-line')        # durable data; one folder per CONNECTION (provider = endpoint host)
+ANTHROPIC = 'api.anthropic.com'
+ANTH_DIR = os.path.join(HSL_STATE, ANTHROPIC)                    # the Claude account (limited connection): limit axis, token axis, cost profile, usage poll
+STATE = os.path.join(ANTH_DIR, 'analyze-state.json')
+OUT = os.path.join(ANTH_DIR, 'profile')
+MEASURES = os.path.join(ANTH_DIR, 'measures.jsonl')              # one record per completed UTC day (long-term log)
 STATE_VERSION = 7                # 5: per-message start/end (speed); 6: + cache write 1h (5m = cw - cw1h); 7: + effort, speed, thinking
-HISTORY = os.path.join(CLAUDE, '.statusline-history')            # LIMIT axis: "epoch wk_x100 5h_x100 wk_reset 5h_reset"
-TOKENS = os.path.join(CLAUDE, '.statusline-tokens')              # TOKEN axis: raw tokens per 5-min bucket, model, effort, speed (never trimmed)
-TOK_HEADER = '# epoch(5min bucket, UTC) model effort speed msgs input output cache_read cache_write_5m cache_write_1h thinking(of output)\n'
+HISTORY = os.path.join(ANTH_DIR, 'history')            # LIMIT axis: "epoch wk_x100 5h_x100 wk_reset 5h_reset"
+RESET_DROP = 300                 # x100: a wk% drop this big within one weekly window = manual reset (history has 1-point backward steps = noise)
+TOKENS = os.path.join(ANTH_DIR, 'tokens')              # TOKEN axis: raw tokens per 5-min bucket, model, effort, speed (never trimmed)
+TOK_FIELDS = ('input', 'output', 'cache_read', 'cache_write_5m', 'cache_write_1h')
 TOK_BUCKET = 300
+# OUTSIDE USE: the limits are account-wide, the transcripts are this machine's (+ imports). Copies of another machine's
+# ~/.claude/projects go to IMPORTS/<host>/ (any tree of *.jsonl): their messages count as mine (cost, matrices,
+# calibration), their tokens go to their own axis TOKENS@<host>. Use nobody imported shows as an excess of the 5h%
+# step over the local cost: hours far above the median 5h%-per-$ are flagged and kept out of calibration and the fit.
+IMPORTS = os.path.join(HSL_STATE, 'imports')
+OUT_MIN_USD, OUT_RATIO, OUT_MIN_PTS = 1.0, 2.0, 3.0   # median over hours with >= $1; flag: 5h step > 2x expected and >= 3 points over it
+OUT_MIN_HOURS = 24              # no flags until the median rests on this many hours (outside use must stay the minority)
 SLOT, SLOTS = 3600, 168          # 1-hour grid; 168 slots = one week. slot index = (epoch // 3600) % 168
 KEEP_DAYS, PROFILE_DAYS, FROZEN_DAYS = 15, 14, 120   # frozen = per-slot cost kept after per-message detail expires
-HOME = os.path.expanduser('~')
-HSL_STATE = os.path.join(HOME, '.local/state/harness-status-line')        # durable: connection profiles, collector state
-HSL_CFG = os.path.join(HOME, '.config/harness-status-line/connections.json')   # optional overrides (billing, prices)
+HSL_CFG = os.path.join(HSL_STATE, 'config.json')                  # optional overrides (billing, prices); the old ~/.config/harness-status-line/connections.json is read when this one is missing
+HSL_CFG_OLD = os.path.join(HOME, '.config/harness-status-line/connections.json')
+# LIMIT POLL: an idle CLI session keeps the limits of its last response and the VS Code extension has no status line, so
+# the limit axis had gaps. --collect asks the account's usage endpoint (the one behind /usage; undocumented) with the
+# OAuth access token of ~/.claude/.credentials.json: read in memory only, never printed, stored or refreshed (Claude
+# Code refreshes it; an expired token = no poll). Rows go to HISTORY in the status line's format. Failures back off.
+USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+CREDENTIALS = os.path.join(CLAUDE, '.credentials.json')
+POLL_MIN, POLL_MAX_BACKOFF, POLL_HEARTBEAT = 240, 3600, 1800   # seconds between polls; backoff cap; a row at least this often
+POLL_REFUSED = (401, 403, 429)                                   # HTTP refusals: 3 tries with a growing wait, then hourly; they never write the stop file
+POLL_STOP_AFTER, COLLECT_STOP_AFTER = 3, 3                      # consecutive other HTTP errors / collector crashes before it stops for good
 SPEED_DAYS = 42                  # speed matrix window (needs more weeks than the load: one hour of the week = 1 sample/week)
 SPEED_K = 4.0                    # pseudo-requests at index 1 per hour of the week (shrinkage of the speed matrix)
 MIN_OUT, MIN_DUR = 50, 1.0       # a response counts for speed only from 50 output tokens and 1 s
 BUSY, LIGHT = 0.92, 1.08         # speed index thresholds of the load modes (busy = slower than usual)
-ANTHROPIC = 'api.anthropic.com'
 
 # USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h. First match wins.
 # Source: Anthropic price table. ASSUMED (not in the table): cache write 1.25x / 2x of input,
@@ -143,7 +164,7 @@ GRID_MARGIN = 1.05                              # prefer the simpler grid unless
 LAMBDAS = (0.3, 3.0, 30.0)                      # ridge strength relative to mean(diag A); pulls bins toward "no effect"
 
 
-def build_pairs(samples, buckets):
+def build_pairs(samples, buckets, skip=()):
     """One row per interval between consecutive history samples and per limit (wk, 5h):
     observed % step y and the token cost spent in the interval per week-slot."""
     pairs = []
@@ -156,7 +177,7 @@ def build_pairs(samples, buckets):
             ov = min(t2, (sl + 1) * SLOT) - max(t1, sl * SLOT)
             if ov > 0 and sl in buckets:
                 cs[sl % SLOTS] = cs.get(sl % SLOTS, 0.0) + buckets[sl] * ov / SLOT
-        if not cs:
+        if not cs or any(sl in skip for sl in range(t1 // SLOT, (t2 - 1) // SLOT + 1)):   # outside use: not my cost
             continue
         if dt <= 10800 and w2 >= w1:
             pairs.append({'lim': 'wk', 'y': (w2 - w1) / 100.0, 'cs': cs, 'day': t1 // 86400})
@@ -216,10 +237,10 @@ def cv_error(pairs, name, lam_rel, k=5, binmap=None):
     return tot
 
 
-def analyze_factors(samples, buckets, mean, min_pairs=150, min_cost=100.0, min_days=14, n_perm=20):
+def analyze_factors(samples, buckets, mean, min_pairs=150, min_cost=100.0, min_days=14, n_perm=20, skip=()):
     """Pick the time grid the data supports (cross-validated by day-blocks), fit it, report factors per week slot."""
     res = {'status': 'insufficient data', 'grid': None, 'factors_slot': None, 'mode_factors': [None] * 3}
-    pairs = build_pairs(samples, buckets)
+    pairs = build_pairs(samples, buckets, skip)
     if pairs:
         last = max(p['day'] for p in pairs)
         pairs = [p for p in pairs if p['day'] > last - RECENT_DAYS]
@@ -344,11 +365,12 @@ def iso_ts(ts):
     return datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp()
 
 
-def scan(path, st):
+def scan(path, st, host=None):
     """Incremental read of one Claude transcript. msgs[id] = [slot, cost, model, in, out, cache_read, cache_write,
     start, end, cache_write_1h, effort, speed, thinking]: start = the previous entry (the request), end = the last
     streamed copy -> response speed; cache_write = 5m + 1h; effort = reasoning effort of the request (low..max, '-' if
-    absent), speed = 'standard' or 'fast' (fast mode), thinking = thinking tokens (part of output)."""
+    absent), speed = 'standard' or 'fast' (fast mode), thinking = thinking tokens (part of output); + host for
+    imported transcripts (local records have 13 fields)."""
     size = os.path.getsize(path)
     rec = st['files'].get(path)
     off = rec[1] if rec and rec[0] <= size else 0
@@ -390,7 +412,7 @@ def scan(path, st):
             msgs[mid] = [int(t) // SLOT, c, model_key(m.get('model')), u.get('input_tokens') or 0,
                          u.get('output_tokens') or 0, u.get('cache_read_input_tokens') or 0, cw, start, t, w1,
                          str(d.get('effort') or '-'), str(u.get('speed') or '-'),
-                         (u.get('output_tokens_details') or {}).get('thinking_tokens') or 0]
+                         (u.get('output_tokens_details') or {}).get('thinking_tokens') or 0] + ([host] if host else [])
         elif len(prev) > 8:
             prev[8] = max(prev[8], t)
         prev_t = t
@@ -410,33 +432,96 @@ def last_limits():
     return res
 
 
-def append_tokens(msgs, now):
-    """TOKEN axis (raw, no prices): append completed 5-min buckets newer than the file's last one.
-    Line: TOK_HEADER (bucket start, message end time; key = bucket, model, effort, speed). Kept forever (~150 lines
-    a day); the LIMIT axis is HISTORY - join them by epoch for any analysis. A file with another header (older
-    layout) is moved aside to '<file>.<epoch>' (never deleted) and the new one is backfilled from the messages kept."""
-    last = 0
+def wk_credit_of(rw):
+    """Points x100 of the weekly limit handed back by manual resets inside the weekly window that ends at rw: the sum of the
+    wk% drops >= RESET_DROP between consecutive history rows with the SAME reset time (a real weekly reset changes it). A reset
+    may be partial (one model, e.g. Fable: its use is taken off the weekly limit). Calibration counts wk% + credit as the
+    use of the week, so it stays comparable with the cost of the whole week."""
+    credit, prev = 0, None
     try:
-        with open(TOKENS) as f:
-            head = f.readline()
-        if head != TOK_HEADER:
-            os.rename(TOKENS, '%s.%d' % (TOKENS, int(now)))
+        for line in open(HISTORY):
+            p = line.split()
+            if len(p) >= 4 and p[0].isdigit() and p[1].isdigit() and p[3].isdigit():
+                cur = (int(p[1]), int(p[3]))
+                if prev and cur[1] == rw and prev[1] == rw and prev[0] - cur[0] >= RESET_DROP:
+                    credit += prev[0] - cur[0]
+                prev = cur
     except OSError:
         pass
+    return credit
+
+
+def parse_tok_line(line):
+    """One line of the token axis -> (bucket, model, effort, speed, msgs, [input, output, cache_read, cache_write_5m,
+    cache_write_1h], thinking) or None. Current format = JSONL (see append_tokens); the legacy whitespace format
+    ('epoch model effort speed msgs input output cache_read cache_write_5m cache_write_1h thinking', '#' header) is still read."""
     try:
-        with open(TOKENS, 'rb') as f:
+        if line.startswith('{'):
+            d = json.loads(line)
+            return (int(d['t']), d['model'], d['effort'], d['speed'], int(d['msgs']), [int(d[k]) for k in TOK_FIELDS], int(d.get('thinking', 0)))
+        p = line.split()
+        if len(p) >= 11 and p[0].isdigit():
+            return (int(p[0]), p[1], p[2], p[3], int(p[4]), [int(x) for x in p[5:10]], int(p[10]))
+    except (ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def read_tokens(path=TOKENS):
+    """Rows of the token axis (either format), in file order; a missing file = no rows."""
+    try:
+        with open(path) as f:
+            for line in f:
+                r = parse_tok_line(line)
+                if r:
+                    yield r
+    except OSError:
+        return
+
+
+def tok_json(r):
+    """A row as one JSONL line, readable by hand: ts = the bucket start in UTC, t = the same as epoch (the join key)."""
+    d = {'t': r[0], 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r[0])), 'model': r[1], 'effort': r[2], 'speed': r[3],
+         'msgs': r[4]}
+    d.update(zip(TOK_FIELDS, r[5]))
+    d['thinking'] = r[6]
+    return json.dumps(d) + '\n'
+
+
+def append_tokens(msgs, now, path=TOKENS, host=None):
+    """TOKEN axis (raw, no prices): append completed 5-min buckets newer than the file's last one, one JSON object per
+    line (JSONL), so the file can be read by hand: t/ts = bucket start (epoch / UTC), model, effort, speed, msgs, input,
+    output, cache_read, cache_write_5m, cache_write_1h, thinking (part of output). Key = bucket x model x effort x speed.
+    Kept forever (~150 lines a day); the LIMIT axis is HISTORY - join them by epoch for any analysis. A file in the legacy
+    whitespace format is converted losslessly; the original is rotated, not deleted: '<file>.<epoch>'.
+    host=None: this machine's messages; host='x': the messages imported from x (file TOKENS@x)."""
+    try:
+        with open(path) as f:
+            head = f.readline()
+        if head and not head.startswith('{'):
+            rows = list(read_tokens(path))
+            tmp = path + '.new'
+            with open(tmp, 'w') as f:
+                f.writelines(tok_json(r) for r in rows)
+            os.rename(path, '%s.%d' % (path, int(now)))
+            os.replace(tmp, path)
+    except OSError:
+        pass
+    last = 0
+    try:
+        with open(path, 'rb') as f:
             f.seek(0, 2)
             f.seek(max(0, f.tell() - 4096))
-            for line in f.read().split(b'\n'):
-                p = line.split()
-                if p and p[0].isdigit():
-                    last = int(p[0])
+            for line in f.read().decode('utf-8', 'replace').split('\n'):
+                r = parse_tok_line(line)
+                if r:
+                    last = r[0]
     except OSError:
         pass
     upto = (int(now) - TOK_BUCKET) // TOK_BUCKET * TOK_BUCKET          # buckets ending >= 5 min ago are complete
     agg = {}
     for v in msgs.values():
-        if len(v) < 13:
+        if len(v) < 13 or (v[13] if len(v) > 13 else None) != host:
             continue
         b = int(v[8]) // TOK_BUCKET * TOK_BUCKET
         if not (last < b < upto):
@@ -445,13 +530,48 @@ def append_tokens(msgs, now):
         a[0] += 1; a[1] += v[3]; a[2] += v[4]; a[3] += v[5]; a[4] += v[6] - v[9]; a[5] += v[9]; a[6] += v[12]
     if not agg:
         return 0
-    new = not os.path.exists(TOKENS)
-    with open(TOKENS, 'a') as f:
-        if new:
-            f.write(TOK_HEADER)
+    with open(path, 'a') as f:
         for k, a in sorted(agg.items()):
-            f.write('%d %s %s\n' % (k[0], ' '.join(re.sub(r'\s', '_', x) for x in k[1:]), ' '.join(map(str, a))))
+            f.write(tok_json((k[0], re.sub(r'\s', '_', k[1]), re.sub(r'\s', '_', k[2]), re.sub(r'\s', '_', k[3]), a[0], a[1:6], a[6])))
     return len(agg)
+
+
+def outside_use(now, msgs):
+    """Per hour (UTC slot of the sample's end) over the profile window: the 5h-limit step between consecutive history
+    samples (<= 2 h apart; a drop = a new 5h window, its new value is the step) against the cost of the messages that
+    ended in between (same 5h reset = same window). Median 5h%-per-$ over hours with >= OUT_MIN_USD; an hour is flagged as outside use (another
+    machine, claude.ai) when its step > OUT_RATIO x the expected one and by >= OUT_MIN_PTS points.
+    -> (hours {slot: [d5h, dwk, usd]}, flagged {slot: excess 5h points over the median}, median)."""
+    since = now - PROFILE_DAYS * 86400
+    rows = []
+    try:
+        for line in open(HISTORY):
+            p = line.split()
+            if len(p) >= 5 and p[0].isdigit() and p[1].isdigit() and p[2].isdigit() and p[4].isdigit() and int(p[0]) >= since:
+                rows.append((int(p[0]), int(p[1]), int(p[2]), int(p[4])))   # only rows with the 5h reset (from 2026-11-12): older ones flap between sessions
+    except OSError:
+        pass
+    ends = sorted((v[8], v[1]) for v in msgs.values() if len(v) > 8 and v[8] >= since - 7200)
+    ts, cum = [e[0] for e in ends], list(itertools.accumulate(e[1] for e in ends))
+    def spent(t1, t2):
+        i, j = bisect.bisect_right(ts, t1), bisect.bisect_right(ts, t2)
+        return (cum[j - 1] if j else 0.0) - (cum[i - 1] if i else 0.0)
+    H = {}
+    for a, b in zip(rows, rows[1:]):
+        if not 0 < b[0] - a[0] <= 7200:
+            continue
+        h = H.setdefault(b[0] // SLOT, [0, 0, 0.0])
+        h[0] += ((b[2] - a[2]) if b[3] == a[3] else b[2]) / 100.0      # points of the 5h limit (new window: from 0)
+        h[1] += max(0, b[1] - a[1]) / 100.0                                    # points of the weekly limit
+        h[2] += spent(a[0], b[0])
+    rs = [h[0] / h[2] for h in H.values() if h[2] >= OUT_MIN_USD]
+    med = median(rs)
+    flagged = {}
+    if med and len(rs) >= OUT_MIN_HOURS:
+        for sl, (d5, dwk, usd) in H.items():
+            if d5 > OUT_RATIO * med * usd + OUT_MIN_PTS:
+                flagged[sl] = round(d5 - med * usd, 1)
+    return H, flagged, med
 
 
 def active_rate(items, cov0, cur):
@@ -691,7 +811,7 @@ def speed_fit(R, now):
 def write_conn_profiles(now, msgs):
     """Daily: one profile per connection (load matrix, speed matrix, load modes, model speeds)."""
     os.makedirs(HSL_STATE, exist_ok=True)
-    cfg = read_json(HSL_CFG)
+    cfg = read_json(HSL_CFG) or read_json(HSL_CFG_OLD)
     R = all_recs(now - SPEED_DAYS * 86400, msgs)
     by = collections.defaultdict(list)
     for r in R:
@@ -716,7 +836,8 @@ def write_conn_profiles(now, msgs):
             idx = [1.0] * SLOTS
         modes = ''.join('2' if x < BUSY else ('0' if x > LIGHT else '1') for x in idx)
         base_s = ' '.join('%s=%d' % (re.sub(r'\s', '_', m), round(v)) for m, v in sorted(base.items())) or '-'
-        p = os.path.join(HSL_STATE, 'conn-' + key)
+        os.makedirs(os.path.join(HSL_STATE, key), exist_ok=True)
+        p = os.path.join(HSL_STATE, key, 'conn')
         with open(p + '.tmp', 'w') as f:
             f.write('%d %s %.1f %s %d %s\n%s\n%s\n%s\n%s\n%s\n' % (
                 now, bill, (cur - cov0) / 24.0, unit, n, '%d' % round(ar) if ar else '-', ' '.join(map(str, L)),
@@ -752,7 +873,7 @@ def rt_dir():
 
 def read_conn_profile(key):
     try:
-        lines = open(os.path.join(HSL_STATE, 'conn-' + key)).read().split('\n')
+        lines = open(os.path.join(HSL_STATE, key, 'conn')).read().split('\n')
         h = lines[0].split()
         L = [int(x) for x in lines[1].split()]
         base = dict(kv.split('=', 1) for kv in lines[4].split() if '=' in kv)
@@ -769,10 +890,175 @@ def atomic_write(p, text):
     os.replace(p + '.%d' % os.getpid(), p)
 
 
+def sl_cache_dir():
+    """The status line's cache dir (tmpfs, else its own fallback) or None."""
+    d = '/tmp/claude-sl-%d' % os.getuid()
+    try:
+        if os.path.islink(d) or not os.path.isdir(d) or os.stat(d).st_uid != os.getuid():
+            d = os.path.join(HSL_STATE, 'cache')
+            if not os.path.isdir(d):
+                return None
+        return d
+    except OSError:
+        return None
+
+
+def sync_hist_last(now, wk, fv, r5, rw):
+    """Tell the CLI status lines about the row just appended: their writers compare against $CACHE_DIR/hist-last
+    ("epoch 5h% wk% rwe wk_x100 5h_x100 r5e") so that a stale lower value is not appended after this one."""
+    d = sl_cache_dir()
+    try:
+        if not d:
+            return
+        p = os.path.join(d, 'hist-last')
+        try:
+            f = open(p).read().split()
+        except OSError:
+            f = []
+        h5 = f[5] if len(f) > 6 and f[5].isdigit() and f[6].isdigit() else '-'      # an unknown 5h keeps the last known one
+        h5r = f[6] if h5 != '-' else '-'
+        hf = f[1] if len(f) > 1 else '-'
+        if fv is not None and r5:
+            hf, h5, h5r = str((fv + 50) // 100), str(fv), str(r5)
+        atomic_write(p, '%d %s %d %d %d %s %s\n' % (now, hf, (wk + 50) // 100, rw, wk, h5, h5r))
+    except OSError:
+        pass
+
+
+POLL_STOP_FILE = 'usage-poll-stopped.lock'                      # in ANTH_DIR; while it exists nothing polls; its text is the reason
+
+
+def poll_read(sp):
+    """usage-poll state: "next_try_epoch fails last_status strikes"; stopped = the stop file exists."""
+    try:
+        f = open(sp).read().split()
+    except OSError:
+        f = []
+    num = lambda i: int(f[i]) if len(f) > i and f[i].lstrip('-').isdigit() else 0
+    return num(0), num(1), (f[2] if len(f) > 2 else '-'), num(3), os.path.exists(os.path.join(os.path.dirname(sp), POLL_STOP_FILE))
+
+
+def poll_usage(now):
+    """One poll of the usage endpoint -> a HISTORY row (on a whole-% change, a new window or the 30-min heartbeat).
+    Stopped completely while the stop file `usage-poll-stopped` exists (it holds the reason). Never asks twice: it is skipped while the status lines (= the headers of the sessions' own API responses) hold fresh
+    limits, while another process is polling or polled < POLL_MIN ago (cron, status lines of any number of sessions share
+    one lock + one timer). A refusal (401/403/429) is retried with a growing wait (8/16/32 min), then once an hour, and never stops it; the stop file is written after POLL_STOP_AFTER consecutive other HTTP errors /
+    unusable answers (no request from cron or any status line after that, until `--resume` or the file is deleted); network
+    errors and an expired token only back off (nothing reached the server). Only the sessions' own responses are recorded then."""
+    os.makedirs(ANTH_DIR, exist_ok=True)
+    sp = os.path.join(ANTH_DIR, 'usage-poll')
+    nt, fails, st0, strikes, stopped = poll_read(sp)
+    if stopped or now < nt:
+        return
+    d_ = sl_cache_dir()
+    try:                                                         # a session's own response limits are fresh -> nothing to ask
+        if d_ and now - int(open(os.path.join(d_, 'lim')).read().split()[0]) < POLL_MIN:
+            return
+    except (OSError, ValueError, IndexError):
+        pass
+    lk = open(os.path.join(ANTH_DIR, 'usage-poll.mutex'), 'w')
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return                                                   # another process is asking right now
+    nt, fails, st0, strikes, stopped = poll_read(sp)             # re-read under the lock: someone may have just polled
+    if stopped or now < nt:
+        return
+    atomic_write(sp, '%d %d %s %d\n' % (now + POLL_MIN, fails, st0, strikes))        # claim the slot before asking
+    def done(kind, status, detail=''):
+        f_, s_, stop = fails, strikes, False
+        if kind == 'ok':
+            f_, s_, wait = 0, 0, POLL_MIN
+        elif kind == 'soft':                                     # no / expired token: not asked, not an error
+            wait = POLL_MIN
+        else:
+            f_ += 1
+            wait = min(POLL_MIN * 2 ** min(f_, 10), POLL_MAX_BACKOFF)
+            if kind == 'http' and status in POLL_REFUSED:        # 401/403/429: may pass by itself (token rotation, rate limit): 3 tries with a growing wait (8/16/32 min), then once an hour, never stopped for good
+                pass
+            elif kind in ('http', 'bad'):
+                s_ += 1
+                stop = s_ >= POLL_STOP_AFTER                     # any other HTTP error / unusable answer: three in a row
+        atomic_write(sp, '%d %d %s %d\n' % (now + wait, min(f_, 10), status, s_))
+        if stop:
+            atomic_write(os.path.join(ANTH_DIR, POLL_STOP_FILE),
+                         'stopped: %s UTC\nreason: %s%s (GET %s)\nrule: any HTTP error other than 401/403/429 (those are retried hourly) or unusable answer, %d in a row (this was #%d)\n'
+                         'effect: no usage requests from cron or any status line; only the sessions\' own response limits are recorded\n'
+                         'resume: python3 -I %s --resume   (or delete this file)\n' % (
+                             datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+                             status, (' ' + detail) if detail else '', USAGE_URL, POLL_STOP_AFTER, s_, os.path.abspath(__file__)))
+    try:
+        o = json.load(open(CREDENTIALS)).get('claudeAiOauth') or {}
+        tok = o.get('accessToken')
+        if not tok or (o.get('expiresAt') or 0) / 1000.0 < now + 60:
+            return done('soft', 'no-token')                      # Claude Code renews it on its next use
+        req = urllib.request.Request(USAGE_URL, headers={'Authorization': 'Bearer ' + tok, 'anthropic-beta': 'oauth-2025-04-20',
+                                                         'User-Agent': 'harness-status-line'})
+        d = json.loads(urllib.request.urlopen(req, timeout=8).read().decode())
+    except urllib.error.HTTPError as e:
+        try:                                                     # the server's own explanation (error JSON, www-authenticate), never our request; long tokens-like strings masked
+            body = e.read(400).decode('utf-8', 'replace')
+        except Exception:
+            body = ''
+        hdr = ' '.join('%s=%s' % (k, e.headers.get(k)) for k in ('server', 'www-authenticate', 'retry-after') if e.headers.get(k))
+        info = re.sub(r'[A-Za-z0-9_.\-]{30,}', '...', ' '.join(('%s %s [%s]' % (e.reason, body, hdr)).split()))
+        return done('http', e.code, info[:300])
+    except Exception:
+        return done('net', 'error')
+    tok = req = None
+
+    def part(k):
+        v = d.get(k) or {}
+        try:
+            r = datetime.datetime.fromisoformat(v['resets_at']).timestamp()
+            return int(round(float(v['utilization']) * 100)), int(round(r / 60.0)) * 60   # the CLI rows are whole minutes
+        except Exception:
+            return None, None
+    wk, rw = part('seven_day')
+    fv, r5 = part('five_hour')
+    if wk is None or not rw or rw <= now:
+        return done('bad', 'bad-data', 'unusable answer: no usable seven_day utilization / reset')
+    if fv is None or not r5 or r5 <= now:
+        fv, r5 = None, None                                      # no active 5h window
+    try:                                                         # fresh server-side limits for a status line whose own are stale
+        rt = rt_dir()
+        if rt:
+            atomic_write(os.path.join(rt, 'lim-poll'), '%d %s %s %d %d\n' % (now, fv if fv is not None else '-', r5 or '-', wk, rw))
+    except OSError:
+        pass
+    last = None
+    try:
+        with open(HISTORY, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4096))
+            ls = f.read().decode('utf-8', 'replace').strip().split('\n')
+        last = ls[-1].split() if ls else None
+    except OSError:
+        pass
+    write = True
+    if last and len(last) >= 4 and last[0].isdigit() and last[3].isdigit():
+        lt, lwk, lrw = int(last[0]), int(last[1]), int(last[3])
+        l5 = int(last[2]) if last[2].isdigit() else None
+        l5r = int(last[4]) if len(last) > 4 and last[4].isdigit() else None
+        if rw < lrw:
+            write = False                                        # an older weekly window than the last row: not ours to add
+        elif now - lt < POLL_HEARTBEAT and rw == lrw and wk // 100 == lwk // 100 and (fv is None or (l5r == r5 and l5 is not None and fv // 100 == l5 // 100)):
+            write = False                                        # no whole-% change inside the same windows
+    if write:
+        line = '%d %d %s %d %s\n' % (now, wk, fv if fv is not None else '-', rw, r5 if r5 else '-')
+        fd = os.open(HISTORY, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+        sync_hist_last(now, wk, fv, r5, rw)
+    done('ok', 'ok')
+
+
 def collect_main():
     now = time.time()
     os.makedirs(HSL_STATE, exist_ok=True)
-    lock = open(os.path.join(HSL_STATE, 'collect.lock'), 'w')
+    lock = open(os.path.join(HSL_STATE, 'collect.mutex'), 'w')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -849,13 +1135,357 @@ def collect_main():
 
 
 
+def burn_fit():
+    """--burn, part 2: a structured token model of the limit, with NO price list. Raw tokens (Mtok) per model family x type
+    (output / cache read / cache write 5m+input / cache write 1h) enter as   limit = sum_g a_g * sum_m sum_k r_k * X[m,k]
+    a_g = scale of a model group (limit points per weighted Mtok), r_k = type ratios relative to cache read (shared by the
+    models, stable), searched on a grid and scored by leave-one-day-out error. The limit LEVEL at every history sample is
+    regressed on the cumulative tokens since the window start (free intercept per weekly / 5h window, weights >= 0): levels
+    are absolute, so no selection on the size of the rise, no gap limit. Then the burn per weighted token unit U is followed
+    in time (mode, UTC block, day; jackknife +-2SE by day; each 5h window). Outside use (another machine) is not removed."""
+    FAM = ('opus', 'sonnet', 'haiku'); TYP = ('out', 'read', 'write5m', 'write1h')
+    T = []                                        # (t, 12 values: per family [out, read, write 5m + input, write 1h] in Mtok)
+    for r in read_tokens():
+        f = 0 if 'opus' in r[1] else 2 if 'haiku' in r[1] else 1
+        v = [x / 1e6 for x in r[5]]
+        x = [0.0] * 12
+        x[f * 4], x[f * 4 + 1], x[f * 4 + 2], x[f * 4 + 3] = v[1], v[2], v[0] + v[3], v[4]
+        T.append((r[0], x))
+    T.sort(key=lambda r: r[0])
+    S = []
+    try:
+        for line in open(HISTORY):
+            p = line.split()
+            if len(p) >= 4 and p[0].isdigit() and p[1].isdigit() and p[3].isdigit():
+                S.append((int(p[0]), int(p[1]) / 100.0, int(p[2]) / 100.0 if p[2].isdigit() else None, int(p[3]),
+                          int(p[4]) if len(p) > 4 and p[4].isdigit() else 0))
+    except OSError:
+        return
+    if not T or not S:
+        return
+    times = [r[0] for r in T]
+
+    def mk_cum(val, ng):                          # val(i) -> ng contributions of bucket i; cum(t) -> cumulative per group
+        P = [[0.0] * (len(T) + 1) for _ in range(ng)]
+        for i in range(len(T)):
+            v = val(i)
+            for g in range(ng):
+                P[g][i + 1] = P[g][i] + v[g]
+
+        def cum(t):
+            i = bisect.bisect_right(times, t - TOK_BUCKET)
+            out = [P[g][i] for g in range(ng)]
+            if i < len(T) and times[i] < t:
+                fr = (t - times[i]) / TOK_BUCKET
+                out = [o + (P[g][i + 1] - P[g][i]) * fr for g, o in enumerate(out)]
+            return out
+        return cum
+
+    def solve(X, y, w, iters=300):                # per-window centering, nonneg coordinate descent; weights, intercepts
+        m = len(X[0])
+        grp = collections.defaultdict(list)
+        for i, k in enumerate(w):
+            grp[k].append(i)
+        Xc = [r[:] for r in X]; yc = y[:]
+        for ids in grp.values():
+            ym = sum(y[i] for i in ids) / len(ids)
+            xm = [sum(X[i][j] for i in ids) / len(ids) for j in range(m)]
+            for i in ids:
+                yc[i] = y[i] - ym
+                Xc[i] = [X[i][j] - xm[j] for j in range(m)]
+        G = [[sum(r[a] * r[b] for r in Xc) for b in range(m)] for a in range(m)]
+        c = [sum(r[a] * yv for r, yv in zip(Xc, yc)) for a in range(m)]
+        b = [0.0] * m
+        for _ in range(iters):
+            for a in range(m):
+                if G[a][a] > 1e-12:
+                    b[a] = max(0.0, (c[a] - sum(G[a][k] * b[k] for k in range(m) if k != a)) / G[a][a])
+        icp = {k: sum(y[i] - sum(bj * xj for bj, xj in zip(b, X[i])) for i in ids) / len(ids) for k, ids in grp.items()}
+        return b, icp
+
+    def err(X, y, w, b, icp, ids):
+        e = [(y[i] - sum(bj * xj for bj, xj in zip(b, X[i])) - icp.get(w[i], 0.0)) ** 2 for i in ids]
+        return (sum(e) / len(e)) ** .5
+
+    def loo_rmse(X, y, w, d, days):
+        e = []
+        for dd in days:
+            tr = [i for i in range(len(y)) if d[i] != dd]; te = [i for i in range(len(y)) if d[i] == dd]
+            bb, ii = solve([X[i] for i in tr], [y[i] for i in tr], [w[i] for i in tr])
+            e += [(y[i] - sum(bj * xj for bj, xj in zip(bb, X[i])) - ii.get(w[i], 0.0)) ** 2 for i in te]
+        return (sum(e) / len(e)) ** .5
+
+    rows = [s for s in S if s[1] is not None]
+    w = [s[3] for s in rows]; y = [s[1] for s in rows]; d = [s[0] // 86400 for s in rows]
+    days = sorted(set(d)); allids = range(len(rows))
+    cumall = mk_cum(lambda i: T[i][1], 12)
+    C = [cumall(s[0]) for s in rows]                       # cumulative Mtok, 12 per sample
+    tot = [C[-1][j] - C[0][j] for j in range(12)]
+    print('\n== token model: weekly limit level vs cumulative raw tokens (limit points per Mtok; no prices)')
+    print(' tokens in the span, Mtok:  %s' % '   '.join('%s: %s' % (FAM[m], ' '.join('%s %.1f' % (TYP[k], tot[m * 4 + k]) for k in range(4))) for m in range(3)))
+    print(' %d samples, %d window(s), %d days (rmse in limit points; LOO = leave one day out)' % (len(rows), len(set(w)), len(days)))
+    ref = []
+    X12 = C
+    b12, i12 = solve(X12, y, w, 800)
+    ref.append(('free 12 weights (model x type)', err(X12, y, w, b12, i12, allids), loo_rmse(X12, y, w, d, days) if len(days) >= 3 else None))
+    Xa = [[sum(c)] for c in C]
+    ba, ia = solve(Xa, y, w)
+    ref.append(('every token alike', err(Xa, y, w, ba, ia, allids), loo_rmse(Xa, y, w, d, days) if len(days) >= 3 else None))
+    GROUPS = [('one scale for all models', [[0, 1, 2]]), ('opus+sonnet | haiku', [[0, 1], [2]]), ('opus | sonnet | haiku', [[0], [1], [2]])]
+    G_OUT, G_W5, G_W1 = (0, 10, 100), (0, 10, 30), (30, 100, 300, 1000)
+    res = []
+    for gname, groups in GROUPS:
+        for ro, r5, r1 in itertools.product(G_OUT, G_W5, G_W1):
+            r = (ro, 1.0, r5, r1)
+            X = [[sum(c[m * 4 + k] * r[k] for m in g for k in range(4)) for g in groups] for c in C]
+            b, icp = solve(X, y, w)
+            lo = loo_rmse(X, y, w, d, days) if len(days) >= 3 else err(X, y, w, b, icp, allids)
+            res.append((lo, err(X, y, w, b, icp, allids), gname, groups, r, b))
+    res.sort(key=lambda r: r[0])
+    for nm, e, lo in ref:
+        print('   reference: %-32s rmse %.2f  LOO %s' % (nm, e, '%.2f' % lo if lo is not None else '-'))
+    print(' structured model, best 5 (type ratios to cache read = 1):')
+    for lo, e, gname, groups, r, b in res[:5]:
+        print('   %-26s out %-4g write5m %-3g write1h %-4g | rmse %.2f LOO %.2f | scales %s' % (
+            gname, r[0], r[2], r[3], e, lo, '  '.join('%s %.4f' % ('+'.join(FAM[m] for m in g), bv) for g, bv in zip(groups, b))))
+    print(' best per model grouping (are the model scales different?):')
+    for gname, _ in GROUPS:
+        r0 = next(r for r in res if r[2] == gname)
+        print('   %-26s rmse %.2f LOO %.2f | scales %s' % (gname, r0[1], r0[0], '  '.join(
+            '%s %.4f' % ('+'.join(FAM[m] for m in g), bv) for g, bv in zip(r0[3], r0[5]))))
+    print(' what the data can pin down (best LOO when one ratio is fixed; a flat row = not identified):')
+    for nm, ix, grid in (('output', 0, G_OUT), ('cache write 5m', 2, G_W5), ('cache write 1h', 3, G_W1)):
+        print('   %-15s %s' % (nm, '  '.join('%g: %.2f' % (v, min(r[0] for r in res if r[4][ix] == v)) for v in grid)))
+    lo, e, gname, groups, r, b = res[0]
+    wt = [0.0] * 12
+    for g, bv in zip(groups, b):
+        for m in g:
+            for k in range(4):
+                wt[m * 4 + k] = bv * r[k]
+    print(' best model weights, limit points per Mtok:')
+    for m in range(3):
+        print('   %-7s %s' % (FAM[m], '   '.join('%s %.4f' % (TYP[k], wt[m * 4 + k]) for k in range(4))))
+    print(' (output/read/write cumulative curves correlate at ~0.999: the data pin down a weighted sum much better than the single')
+    print('  ratios, so read a ratio at the grid edge or a flat row as "not measured", and refit after the mix varies more)')
+    unit = lambda i: sum(wt[k] * T[i][1][k] for k in range(12))        # limit points of the weekly limit per bucket
+    print('\n== limit burn per token unit over time (unit U = tokens weighted by the best model above; 1.00 = average)')
+    DOW = 'Mon Tue Wed Thu Fri Sat Sun'.split()
+    keys_all = {'mode': lambda t: mode_of(t), 'UTC 4h block': lambda t: (t // 3600 % 24) // 4, 'day': lambda t: t // 86400}
+    lab = {'mode': lambda k: ('eco', 'normal', 'peak')[k], 'UTC 4h block': lambda k: '%02d-%02d' % (k * 4, k * 4 + 4),
+           'day': lambda k: '%s %s' % (datetime.date.fromtimestamp(k * 86400).isoformat(), DOW[(k + 3) % 7])}
+    cum1 = mk_cum(lambda i: [unit(i)], 1)
+    X1 = [cum1(s[0]) for s in rows]
+    b1, i1 = solve(X1, y, w)
+    for gname, kf in keys_all.items():
+        used = sorted({kf(r[0]) for r in T if unit(T.index(r)) > 0}) if False else sorted({kf(t) for t, x in T if t >= rows[0][0] - 86400 * 8})
+        ix = {k: j for j, k in enumerate(used)}
+        cumg = mk_cum(lambda i: [unit(i) if kf(T[i][0]) == k else 0.0 for k in used], len(used))
+        X = [cumg(s[0]) for s in rows]
+        tot = [X[-1][j] - X[0][j] for j in range(len(used))]
+        keep = [j for j in range(len(used)) if tot[j] > 1e-9]
+        if len(keep) < 2:
+            continue
+        Xk = [[r[j] for j in keep] for r in X]
+        bg, _ = solve(Xk, y, w)
+        se = None
+        if len(days) >= 3 and gname != 'day':
+            jk = []
+            for dd in days:
+                ids = [i for i in range(len(rows)) if d[i] != dd]
+                jk.append(solve([Xk[i] for i in ids], [y[i] for i in ids], [w[i] for i in ids])[0])
+            mu = [sum(j[a] for j in jk) / len(jk) for a in range(len(keep))]
+            se = [((len(jk) - 1) / len(jk) * sum((j[a] - mu[a]) ** 2 for j in jk)) ** .5 for a in range(len(keep))]
+        print(' %s (overall x1.00 = %.3f pts per U)' % (gname, b1[0]))
+        for a, j in enumerate(keep):
+            print('   %-14s U %7.1f  x%.2f%s' % (lab[gname](used[j]), tot[j], bg[a] / b1[0] if b1[0] else 0,
+                  '' if se is None else '  +-%.2f' % (2 * se[a] / b1[0] if b1[0] else 0)))
+    print('\n 5h windows (each separately): burn of the 5h limit per weekly-weighted token unit U, x1.00 = median window')
+    byw = collections.defaultdict(list)
+    for s in S:
+        if s[4] and s[2] is not None:
+            byw[s[4]].append(s)
+    out = []
+    for r5, v in sorted(byw.items()):
+        lv = [s[2] for s in v]
+        if len(v) < 6 or max(lv) - min(lv) < 5:
+            continue
+        dx = cum1(v[-1][0])[0] - cum1(v[0][0])[0]
+        if dx > 0:
+            out.append((v[0][0], lv[-1] - lv[0], dx))
+    if out:
+        med = sorted(o[1] / o[2] for o in out)[len(out) // 2]
+        for t0, dy, dx in out:
+            dtm = datetime.datetime.fromtimestamp(t0, datetime.timezone.utc)
+            print('   %s %s  +%4.1f pts of 5h  U %5.1f  x%.2f' % (dtm.strftime('%m-%d %H:%M'), DOW[dtm.weekday()], dy, dx, dy / dx / med))
+    print(' no +-: too few days; groups with U ~ 0 are dropped; x is relative, the unit itself is a fitted number (see weights above).')
+
+
+def burn_report():
+    """--burn: does the burn rate (limit % per $) differ by hour / mode / weekday / day? Read-only, from the two raw axes
+    (HISTORY + TOKENS): every interval between consecutive samples of ONE weekly window (<= 90 min) is spread over its
+    hours by the cost spent in them. Index 1.00 = the average. The limit has whole-% resolution (1% of the week ~ $10),
+    so a group needs a few $100 before its index means anything; the CI is a bootstrap over whole days."""
+    B = collections.defaultdict(float)
+    for r in read_tokens():
+        B[r[0] // TOK_BUCKET] += sum(x * y for x, y in zip(r[5], price_for(r[1]))) / 1e6
+    S = []
+    try:
+        for line in open(HISTORY):
+            p = line.split()
+            if len(p) >= 4 and p[0].isdigit() and p[1].isdigit() and p[3].isdigit():
+                S.append((int(p[0]), int(p[1]), int(p[2]) if p[2].isdigit() else None, int(p[3])))
+    except OSError:
+        pass
+    flagged = set()
+    try:                                                          # hours of outside use (another machine) are not my cost
+        o = (json.load(open(OUT + '.json')).get('outside_use') or {})
+        flagged = {int(k) for k in (o.get('flagged_hours_utc (excess 5h points)') or {}) if str(k).isdigit()}
+    except Exception:
+        pass
+    rows = []                                                     # (day, hour of day, mode, limit, d%, $)
+    for (t1, w1, f1, r1), (t2, w2, f2, r2) in zip(S, S[1:]):
+        if not 0 < t2 - t1 <= 5400 or w2 < w1 or r1 != r2:
+            continue
+        parts = {}
+        for b in range(t1 // TOK_BUCKET, (t2 - 1) // TOK_BUCKET + 1):
+            ov = min(t2, (b + 1) * TOK_BUCKET) - max(t1, b * TOK_BUCKET)
+            if ov > 0 and b in B:
+                h = b * TOK_BUCKET // 3600
+                parts[h] = parts.get(h, 0.0) + B[b] * ov / TOK_BUCKET
+        tot = sum(parts.values())
+        if tot <= 0 or any(h in flagged for h in parts):
+            continue
+        for lim, d in (('wk', w2 - w1), ('5h', (f2 - f1) if f1 is not None and f2 is not None and f2 >= f1 else None)):
+            if d is not None:
+                for h, c in parts.items():
+                    rows.append((h // 24, h % 24, mode_of(h * 3600), lim, d / 100.0 * c / tot, c))
+    if not rows:
+        print('no usable intervals yet (need history samples of the same weekly window plus token buckets)')
+        return
+    days = sorted({r[0] for r in rows})
+    DOW = 'Mon Tue Wed Thu Fri Sat Sun'.split()
+    dow = lambda d: DOW[(d + 3) % 7]
+    print('history %s -> %s UTC, %d days; outside-use hours skipped: %d' % (
+        datetime.datetime.fromtimestamp(S[0][0], datetime.timezone.utc).strftime('%m-%d %H:%M'),
+        datetime.datetime.fromtimestamp(S[-1][0], datetime.timezone.utc).strftime('%m-%d %H:%M'), len(days), len(flagged)))
+    if len(days) < 14:
+        print('NOTE: %d days - the fit of mode factors needs >= 14; read the groups below as a hint, not a result' % len(days))
+    groups = [('mode (eco / normal / peak, UTC schedule)', lambda r: r[2], lambda k: ('eco', 'normal', 'peak')[k]),
+              ('UTC hour block', lambda r: r[1] // 3 * 3, lambda k: '%02d-%02d' % (k, k + 3)),
+              ('weekday', lambda r: (r[0] + 3) % 7, lambda k: DOW[k]),
+              ('day', lambda r: r[0], lambda k: '%s %s' % (datetime.date.fromtimestamp(k * 86400).isoformat(), dow(k)))]
+    rnd = random.Random(1)
+    for lim in ('wk', '5h'):
+        R = [r for r in rows if r[3] == lim]
+        y0, c0 = sum(r[4] for r in R), sum(r[5] for r in R)
+        if c0 <= 0 or y0 <= 0:
+            continue
+        k0 = y0 / c0
+        print('\n== %s limit: %.1f points over $%.0f -> %.3f %%/$ (1%% ~ $%.0f)' % (lim, y0, c0, k0, 1 / k0))
+        for title, key, name in groups:
+            print(' ' + title)
+            G = collections.defaultdict(lambda: [0.0, 0.0])
+            for r in R:
+                g = G[key(r)]; g[0] += r[4]; g[1] += r[5]
+            for gk in sorted(G):
+                y, c = G[gk]
+                idx = (y / c) / k0 if c > 0 else None
+                ci = ''
+                if title not in ('day', 'weekday') and len(days) >= 4 and c > 0 or title == 'weekday' and len(days) >= 14 and c > 0:
+                    vals = []
+                    for _ in range(300):
+                        cnt = collections.Counter(rnd.choice(days) for _ in days)
+                        ty = sum(r[4] * cnt[r[0]] for r in R); tc = sum(r[5] * cnt[r[0]] for r in R)
+                        gy = sum(r[4] * cnt[r[0]] for r in R if key(r) == gk); gc = sum(r[5] * cnt[r[0]] for r in R if key(r) == gk)
+                        if gc > 0 and tc > 0 and ty > 0:
+                            vals.append((gy / gc) / (ty / tc))
+                    vals.sort()
+                    if len(vals) > 20:
+                        ci = '  90%% CI %.2f..%.2f' % (vals[int(.05 * len(vals))], vals[int(.95 * len(vals))])
+                print('  %-14s $%6.0f  %5.1f pts  idx %s%s' % (name(gk), c, y, '%.2f' % idx if idx is not None else '-', ci))
+
+
+def collect_guarded():
+    """--collect, the one entry for cron and the status lines: collector + usage poll. A crash is counted; after
+    COLLECT_STOP_AFTER in a row it stops for good (the status lines then do not even start it) until `--resume`."""
+    stop, fp = os.path.join(HSL_STATE, 'collect-stopped.lock'), os.path.join(HSL_STATE, 'collect-fails')
+    if os.path.exists(stop):
+        return
+    try:
+        collect_main()
+        os.makedirs(HSL_STATE, exist_ok=True)
+        poll_usage(int(time.time()))
+    except Exception as e:
+        try:
+            os.makedirs(HSL_STATE, exist_ok=True)
+            try:
+                n = int(open(fp).read().split()[0]) + 1
+            except (OSError, ValueError, IndexError):
+                n = 1
+            msg = '%s: %s' % (type(e).__name__, str(e)[:160].replace('\n', ' '))
+            atomic_write(fp, '%d %d %s\n' % (n, time.time(), msg))
+            if n >= COLLECT_STOP_AFTER:
+                atomic_write(stop, 'stopped: %s UTC\nreason: %s (crash #%d in a row)\neffect: the collector (activity, work/spd) and the usage poll do not run; the status lines still record their own response limits\nresume: python3 -I %s --resume   (or delete this file)\n' % (
+                    datetime.datetime.fromtimestamp(time.time(), datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), msg, n, os.path.abspath(__file__)))
+        except Exception:
+            pass
+    else:
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+
+
+def health():
+    """--health: the state of the collector and the usage poll (no network, nothing written)."""
+    now = time.time()
+    def rd(n, d=HSL_STATE):
+        try:
+            return open(os.path.join(d, n)).read().strip()
+        except OSError:
+            return ''
+    print('collector: %s' % ('STOPPED: %s' % rd('collect-stopped.lock') if rd('collect-stopped.lock') else
+                             'ok' if not rd('collect-fails') else 'failing (%s)' % rd('collect-fails')))
+    nt, fails, st, strikes, stopped = poll_read(os.path.join(ANTH_DIR, 'usage-poll'))
+    print('usage poll: %s | last status %s | consecutive failures %d, errors in a row %d/%d | next try %s' % (
+        'STOPPED' if stopped else 'running', st, fails, strikes, POLL_STOP_AFTER,
+        'never (until resumed)' if stopped else 'in %d s' % max(0, nt - now) if nt else '-'))
+    if stopped:
+        print('  ' + rd(POLL_STOP_FILE, ANTH_DIR).replace('\n', '\n  '))
+    d = sl_cache_dir()
+    try:
+        age = now - int(open(os.path.join(d, 'lim')).read().split()[0])
+        print('limits from the sessions: %d s old (%s)' % (age, 'fresh, no poll needed' if age < POLL_MIN else 'stale, the poll may ask'))
+    except Exception:
+        print('limits from the sessions: none')
+    if rd('collect-stopped.lock'):
+        print('-> `python3 -I %s --resume` after fixing the cause' % os.path.abspath(__file__))
+
+
 def main():
+    if '--burn' in sys.argv[1:]:
+        burn_report()
+        burn_fit()
+        return
+    if '--health' in sys.argv[1:]:
+        health()
+        return
+    if '--resume' in sys.argv[1:]:
+        for d, n in ((HSL_STATE, 'collect-stopped.lock'), (HSL_STATE, 'collect-fails'), (ANTH_DIR, 'usage-poll'), (ANTH_DIR, POLL_STOP_FILE)):
+            try:
+                os.remove(os.path.join(d, n))
+            except OSError:
+                pass
+        print('resumed: collector and usage poll errors cleared')
+        return
     if '--collect' in sys.argv[1:]:
-        return collect_main()
+        collect_guarded()
+        return
     if not os.path.isdir(PROJECTS):                  # no Claude Code here: connection profiles only
         write_conn_profiles(time.time(), {})
         return
-    lock = open(STATE + '.lock', 'w')
+    os.makedirs(ANTH_DIR, exist_ok=True)
+    lock = open(os.path.join(ANTH_DIR, 'analyze.mutex'), 'w')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -878,6 +1508,15 @@ def main():
     for f in glob.glob(PROJECTS + '/**/*.jsonl', recursive=True):
         if os.path.getmtime(f) >= now - KEEP_DAYS * 86400:
             scan(f, st)
+    imported = {}
+    for d in sorted(glob.glob(os.path.join(IMPORTS, '*'))):      # copies of other machines' transcripts (read-only)
+        host = re.sub(r'\W', '_', os.path.basename(d))
+        if not os.path.isdir(d):
+            continue
+        for f in glob.glob(d + '/**/*.jsonl', recursive=True):
+            if os.path.getmtime(f) >= now - KEEP_DAYS * 86400:
+                scan(f, st, host)
+        imported[host] = 0
     cut = int((now - KEEP_DAYS * 86400) // SLOT)
     for k, v in st['msgs'].items():                  # expiring messages: keep their cost per slot
         if v[0] < cut and not rescan:            # after a rescan the old slots are already in 'frozen'
@@ -887,8 +1526,12 @@ def main():
     st['files'] = {k: v for k, v in st['files'].items() if os.path.exists(k)}
     try:
         tok_new = append_tokens(st['msgs'], now)
+        for host in imported:
+            imported[host] = {'messages': sum(1 for v in st['msgs'].values() if len(v) > 13 and v[13] == host),
+                              'token_buckets_appended': append_tokens(st['msgs'], now, '%s@%s' % (TOKENS, host), host)}
     except OSError as e:
         tok_new = 'error: %s' % e
+    o_hours, o_flag, o_med = outside_use(now, st['msgs'])
 
     buckets = collections.defaultdict(float)
     for slot, c, *_ in st['msgs'].values():
@@ -906,7 +1549,7 @@ def main():
         tot[s % SLOTS] += buckets.get(s, 0.0)
     mean = [tot[i] / occ[i] if occ[i] else 0.0 for i in range(SLOTS)]
 
-    mf = analyze_factors(read_samples(), buckets, mean)
+    mf = analyze_factors(read_samples(), buckets, mean, skip=o_flag)
     fm = mf['mode_factors']
     fac = [x if x is not None else 1.0 for x in fm]                    # eco, norm, peak; 1 until anything is known
     wb = {sl_: c_ * fac[mode_of(sl_ * SLOT)] for sl_, c_ in buckets.items()}   # cost weighted by how fast each mode burns the limit
@@ -914,10 +1557,14 @@ def main():
     lim = override or last_limits()
     scale, basis = None, 'none'
     if lim and lim[1] > now - 3600:
-        wk_pct, week_start = lim[0] / 100.0, lim[1] - 604800
+        wk_pct, week_start = (lim[0] + wk_credit_of(lim[1])) / 100.0, lim[1] - 604800
         week_cost = sum(c for s, c in wb.items() if s * SLOT >= week_start)
+        o_wk = sum(o_hours[s][1] for s in o_flag if s * SLOT >= week_start)     # outside use: not my cost
+        o_cost = sum(wb.get(s, 0.0) for s in o_flag if s * SLOT >= week_start)
+        wk_pct, week_cost = wk_pct - o_wk, week_cost - o_cost
         if wk_pct >= 1.0 and week_cost > 0:
-            scale, basis = wk_pct / week_cost, 'this week: %.1f%% / $%.2f' % (wk_pct, week_cost)
+            scale, basis = wk_pct / week_cost, 'this week: %.1f%% / $%.2f' % (wk_pct, week_cost) + (
+                ' (without %d outside-use hours: %.0f%% / $%.2f)' % (len([s for s in o_flag if s * SLOT >= week_start]), o_wk, o_cost) if o_wk or o_cost else '')
             if not override:
                 st['cal'] = {'scale': scale, 'at': now}
     if scale is None and st.get('cal'):
@@ -1019,6 +1666,15 @@ def main():
         'cost_usd_per_active_hour': round(ar_usd, 2) if ar_usd else None,
         'wk_pct_per_active_hour (work base)': round(ar_usd * scale, 3) if scale and ar_usd else None,
         'token_log_buckets_appended': tok_new,
+        'imports': imported or 'none (copies of other machines\' ~/.claude/projects go to %s/<host>/)' % IMPORTS,
+        'outside_use': {
+            'median_5h_pct_per_usd': round(o_med, 3) if o_med else None,
+            'hours_seen': len(o_hours),
+            'status': 'active' if o_med and sum(1 for h in o_hours.values() if h[2] >= OUT_MIN_USD) >= OUT_MIN_HOURS else
+                      'collecting (%d/%d hours with >= $%g)' % (sum(1 for h in o_hours.values() if h[2] >= OUT_MIN_USD), OUT_MIN_HOURS, OUT_MIN_USD),
+            'flagged_hours_utc (excess 5h points)': {time.strftime('%Y-%m-%d %H', time.gmtime(s_ * SLOT)): x for s_, x in sorted(o_flag.items())},
+            'excess_5h_points_total': round(sum(o_flag.values()), 1),
+            'rule': '5h step > %.0fx median x local cost + %.0f points; excluded from calibration and the mode fit' % (OUT_RATIO, OUT_MIN_PTS)},
         'cost_usd_by_mode(eco,norm,peak)': [round(x, 2) for x in modecost],
         'wall_hours_covered': hours,
         'tokens_total': tot_tok,
@@ -1037,7 +1693,7 @@ def main():
         json.dump(st, open(tmp, 'w'))
         os.replace(tmp, STATE)
     try:
-        summary['connections'] = write_conn_profiles(now, st['msgs'])
+        summary['connections'] = write_conn_profiles(now, {k: v for k, v in st['msgs'].items() if len(v) < 14})   # this machine only
     except Exception as e:                            # never lose the Claude profile because of another harness
         summary['connections'] = 'error: %s' % e
     json.dump(summary, open(OUT + '.json', 'w'), indent=1)

@@ -80,7 +80,7 @@ The purpose is to show **roughly** where the peak is, so heavy work is not plann
 - **Mode coefficients** — ridge regression "percent rose by Δ at token cost $C over the week's slots"; shrunk toward 1, amplitude understated (caution).
 - **Choosing flat vs 3 modes** — cross-validation by days; 3 modes are accepted only if they beat `flat` by >5 % and themselves with shuffled slot labels (null).
 - Data for the 5h and weekly limits are taken together. Requirements: ≥150 intervals, ≥14 days, ≥$100 cost; otherwise preliminary coefficients (see above) and default boundaries.
-- Result: `.statusline-profile.json` (`burn_factors`: grid, `schedule_utc` — boundaries and whether shifted, CV errors, coefficients by hour) and profile lines 3–5.
+- Result: `profile.json` (`burn_factors`: grid, `schedule_utc` — boundaries and whether shifted, CV errors, coefficients by hour) and profile lines 3–5.
 
 **Honestly about accuracy** (synthetic data with a known answer, 40 days): no false shifts on flat and standard history; a true +2 h shift was found with error ≤1 h; a −1 h shift went unnoticed (the method is cautious and misses small shifts). Readings accumulate faster thanks to recording on every whole-percent change.
 
@@ -97,7 +97,21 @@ Red — if the limit runs out before the reset, dim — if you make it. If you m
 
 ### Token and model measurements
 
-`statusline-analyze.py` (once a day, ≈4 s), besides the profile, writes a 14-day summary to `~/.claude/.statusline-profile.json`: tokens by type (input / output / cache read / cache write), token and cost usage **by model** (cost share, output tokens per hour), **by mode** (eco / normal / peak, per wall-clock hour) and by UTC hour of day. Separately, once per completed day, it appends a line to `~/.claude/.statusline-measures.jsonl` (cost, tokens and per-model breakdown for the day + the last `wk%` reading) — this journal outlives the analysis window and accumulates history for future per-model calibration.
+`statusline-analyze.py` (once a day, ≈4 s), besides the profile, writes a 14-day summary to `~/.local/state/harness-status-line/api.anthropic.com/profile.json`: tokens by type (input / output / cache read / cache write), token and cost usage **by model** (cost share, output tokens per hour), **by mode** (eco / normal / peak, per wall-clock hour) and by UTC hour of day. Separately, once per completed day, it appends a line to `~/.local/state/harness-status-line/api.anthropic.com/measures.jsonl` (cost, tokens and per-model breakdown for the day + the last `wk%` reading) — this journal outlives the analysis window and accumulates history for future per-model calibration.
+
+### Recording without an open session (cron) and the stop on errors
+
+The limit axis is written from the responses of the open sessions (the status line) and, between them, by a poll of the account usage endpoint inside `statusline-analyze.py --collect`. The status line starts `--collect` itself every ≥5 min while a session is open; to keep recording with no session (night, closed terminal) add the same command to cron — it is the same code, safe to run in parallel with the status lines:
+
+```bash
+(crontab -l 2>/dev/null | grep -v statusline-analyze; echo '*/5 * * * * nice -n 19 timeout 60 /usr/bin/python3 -I $HOME/.local/share/harness-status-line/statusline-analyze.py --collect >/dev/null 2>&1') | crontab -
+```
+
+(WSL: the cron daemon is not started by default — `sudo service cron start`, or `[boot] command=service cron start` in `/etc/wsl.conf`.)
+
+- **Never asks twice.** No request is sent while a session's own limits are fresh (the headers of its API responses, < 4 min), while another process is polling, or < 4 min after the last poll — cron and any number of sessions share one lock and one timer.
+- **Stops on errors.** A refusal (401/403/429) is retried 3 times with a growing wait, then once an hour, and never stops the poll (the first 403 passed by itself, probably a token rotation). Three other HTTP errors or unusable answers in a row, with a growing wait between them, write the stop file `~/.local/state/harness-status-line/api.anthropic.com/usage-poll-stopped.lock` with the reason and time; from then on neither cron nor any status line sends a usage request, and only the sessions' own response limits are recorded, until you have understood the cause. A network error or an expired token only backs off (nothing reached the server). Three crashes of the collector in a row write `collect-stopped.lock` the same way and stop the collector and the poll.
+- **Look and resume:** `python3 -I ~/.local/share/harness-status-line/statusline-analyze.py --health` (state and reasons, no network); `--resume` (or deleting the stop file) after the cause is fixed.
 
 ### How resources are saved
 
@@ -109,14 +123,15 @@ Red — if the limit runs out before the reset, dim — if you make it. If you m
 | File | Where | Purpose |
 |---|---|---|
 | `/tmp/claude-sl-$UID/*` | RAM | caches of the line, transcript, git, mode, coefficient — safe to delete |
-| `~/.claude/.statusline-history` | disk | `wk%`/`5h%` reading (+ weekly and 5h reset times) on **every whole-percent change** + a pulse every 30 min; kept forever — the **limit axis**. A `wk%` lower than the last sample of the same week is not written: an idle session keeps passing the limits of its last response |
-| `~/.claude/.statusline-daily` | disk | 7-day pace, recomputed once a day (UTC) |
-| `~/.claude/.statusline-profile[.json]` | disk | line 2 — matrix 1 (load by 168 hours of the week, thousandths of a % of the limit); line 3 — coefficients `eco norm peak` (×100 or `-`); line 4 — matrix 2 (burn speed by 168 hours, ×100); line 5 — mode boundaries; line 6 — `fit`/`prelim`/`-` (how the coefficients were obtained); line 7 — base of `work`: thousandths of a % per active hour; `.json` — summary |
-| `~/.claude/.statusline-tokens` | disk | the **token axis**: raw tokens per 5 min, model, reasoning effort and speed (`epoch model effort speed msgs input output cache_read cache_write_5m cache_write_1h thinking`; `thinking` is part of `output`), no prices; kept forever. A file with an older header is moved aside to `.statusline-tokens.<epoch>`. Join with the history by epoch |
-| `~/.claude/.statusline-analyze-state.json` | disk | incremental analysis state |
-| `~/.claude/.statusline-measures.jsonl` | disk | daily journal: tokens and cost by model |
+| `~/.local/state/harness-status-line/api.anthropic.com/history` | disk | `wk%`/`5h%` reading (+ weekly and 5h reset times) on **every whole-percent change** + a pulse every 30 min; kept forever — the **limit axis**. Besides the CLI status line the analyzer's `--collect` polls the account usage endpoint every ≥4 min (OAuth access token, see AGENTS.md) and adds rows in the same format, so the axis no longer depends on a live CLI session. A `wk%` lower than the last sample of the same week is not written: an idle session keeps passing the limits of its last response |
+| `~/.local/state/harness-status-line/api.anthropic.com/daily` | disk | 7-day pace, recomputed once a day (UTC) |
+| `~/.local/state/harness-status-line/api.anthropic.com/profile[.json]` | disk | line 2 — matrix 1 (load by 168 hours of the week, thousandths of a % of the limit); line 3 — coefficients `eco norm peak` (×100 or `-`); line 4 — matrix 2 (burn speed by 168 hours, ×100); line 5 — mode boundaries; line 6 — `fit`/`prelim`/`-` (how the coefficients were obtained); line 7 — base of `work`: thousandths of a % per active hour; `.json` — summary |
+| `~/.local/state/harness-status-line/api.anthropic.com/tokens` | disk | the **token axis**: raw tokens per 5 min, model, reasoning effort and speed as **JSONL**, one JSON object per line, readable by hand (`t`/`ts` bucket start as epoch / UTC, `model`, `effort`, `speed`, `msgs`, `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`, `thinking`; `thinking` is part of `output`), no prices; kept forever. Old files are **rotated, not deleted**: when the format changes the original is renamed to `tokens.<epoch>` (the legacy whitespace format is still read and converted losslessly). Imported machines: `tokens@<host>`. Join with the history by epoch |
+| `~/.local/state/harness-status-line/imports/<host>/` | disk | **other machines** under the same account: copies of their `~/.claude/projects`, made by `~/.local/share/harness-status-line/hsl-import.sh <user@address | ssh alias>` (rsync of `*.jsonl` over ssh, the dir name = the parameter: `user@address` → `user_address`, an alias as is; then reruns the analyzer), read-only; their use counts as mine. Use not imported is detected as **outside use** (5h step far above the median 5h%-per-$ of local cost) and kept out of calibration and the mode fit — see `outside_use` in the profile JSON |
+| `~/.local/state/harness-status-line/api.anthropic.com/analyze-state.json` | disk | incremental analysis state |
+| `~/.local/state/harness-status-line/api.anthropic.com/measures.jsonl` | disk | daily journal: tokens and cost by model |
 
-Analyzer assumptions (in `.statusline-profile.json`): prices come from the Anthropic table, but cache-write prices (1.25× / 2× of input) and Haiku 5.5 cache-read (0.1×) are **assumptions**; only the ratios matter, the absolute scale is calibrated against the real `wk%`. Transcripts see only this machine while the limit covers the whole account, so the estimate is more accurate the more work is done here.
+Analyzer assumptions (in `profile.json`): prices come from the Anthropic table, but cache-write prices (1.25× / 2× of input) and Haiku 5.5 cache-read (0.1×) are **assumptions**; only the ratios matter, the absolute scale is calibrated against the real `wk%`. Transcripts see only this machine while the limit covers the whole account, so the estimate is more accurate the more work is done here.
 
 ## Other harnesses
 

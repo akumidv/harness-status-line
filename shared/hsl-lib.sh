@@ -2,7 +2,7 @@
 # Needs: $now (epoch). No forks on the hot path: only `read` of small files; python runs in the background.
 #
 # Files (written by statusline-analyze.py):
-#   $HSL_STATE/conn-<host>   daily profile of a connection (endpoint host):
+#   $HSL_STATE/<host>/conn   daily profile of a connection (endpoint host; one folder per connection = provider):
 #       1 "updated billing coverage_days unit speed_samples"  billing = limited|metered|free, unit = tok|usd
 #       2 load matrix L: my usage per hour of the week (tokens, or USD x10000)      168 numbers
 #       3 speed matrix S: answer speed vs the models' own median, x100 (100 = usual)  168 numbers
@@ -27,7 +27,7 @@ hsl_kick() {
     [ -f "$HSL_AN" ] || return
     local cl=0 d sd=""
     [ -f "$HSL_RT/collect-last" ] && read -r cl < "$HSL_RT/collect-last"
-    if [ $(( now - ${cl:-0} )) -ge "$HSL_COLLECT_TTL" ]; then
+    if [ $(( now - ${cl:-0} )) -ge "$HSL_COLLECT_TTL" ] && [ ! -f "$HSL_STATE/collect-stopped.lock" ]; then
         printf '%s\n' "$now" > "$HSL_RT/collect-last"
         ( nice -n 19 python3 -I "$HSL_AN" --collect >/dev/null 2>&1 & )
     fi
@@ -101,7 +101,7 @@ HSL_ICON=('🐇' "${E}[33m▸$R" '🐌')                       # speed: 0 light 
 #   3) else nothing to compare: "⚡SPEED_TEXT". The hour-of-week matrix is not shown (decided 2026-11-10). HSL_V = spd x100.
 hsl_spd() {
     REPLY=""; HSL_V=""
-    local P="$HSL_STATE/conn-$1" l5="" v="" cur bc kv
+    local P="$HSL_STATE/$1/conn" l5="" v="" cur bc kv
     case "$4" in ''|*[!0-9]*) ;; *)
         [ -n "$3" ] && [ -f "$P" ] && { read -r _; read -r _; read -r _; read -r _; read -r l5; } < "$P"
         for kv in $l5; do
@@ -129,7 +129,7 @@ hsl_spd() {
 hsl_seg() {
     REPLY=""; HSL_USE=""
     local sp seg="" pc red
-    [ -f "$HSL_STATE/conn-$1" ] || return 1
+    [ -f "$HSL_STATE/$1/conn" ] || return 1
     hsl_spd "$1" "$2" "$3" "$4"; sp=$REPLY
     if [ -n "$HSL_REL" ]; then
         hsl_fx "$HSL_REL"; red=150; [ -n "$HSL_V" ] && [ "$HSL_V" -lt 95 ] && red=125

@@ -8,7 +8,7 @@ and deploy them back onto a machine. Never copies whole configs - only the statu
   options: --only shared claude qwen codex mcode (or a profile name such as codex-personal)
 
 Harnesses and what is extracted (see README.md):
-  shared  ~/.local/share/harness-status-line   statusline-analyze.py (all harnesses), hsl-lib.sh (bash helpers)
+  shared  ~/.local/share/harness-status-line   statusline-analyze.py (all harnesses), hsl-lib.sh (bash helpers), hsl-import.sh (import another machine's transcripts)
   claude  ~/.claude   statusline-command.sh, settings.json -> "statusLine"
   qwen    ~/.qwen     statusline-command.sh, settings.json -> "ui.statusLine"
   codex   ~/.codex, ~/.codex-personal   config.toml -> [tui] status_line* keys
@@ -35,7 +35,7 @@ STAMP = time.strftime('%Y%m%d-%H%M%S')
 # name = target (profile) name; harness = repo sub-folder. Repo dir: <harness>/ or <harness>/<name>/ when they differ.
 TARGETS = [
     dict(name='shared', harness='shared', home='.local/share/harness-status-line',
-         files=['statusline-analyze.py', 'hsl-lib.sh']),
+         files=['statusline-analyze.py', 'hsl-lib.sh', 'hsl-import.sh']),
     dict(name='claude', harness='claude', home='.claude',
          files=['statusline-command.sh'],
          json=dict(file='settings.json', path=['statusLine'], fragment='settings.fragment.json')),
