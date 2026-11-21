@@ -42,8 +42,9 @@ HSL_ANTH="$HOME/.local/state/harness-status-line/api.anthropic.com"
 # --- schedule constants (UTC) ------------------------------------------------
 # peak = weekdays PEAK_START..PEAK_END; eco = weekends + weekdays before ECO_END; else normal
 PEAK_LAST_DOW=5; PEAK_START=13; PEAK_END=19; ECO_END=8
+MODES=""   # from the profile (line 5): the mode of each of the 168 week slots (epoch hour % 168; 0 eco, 1 normal, 2 peak), derived from the data; empty = the schedule above
 HISTORY="$HSL_ANTH/history"   # LIMIT axis: "epoch wk%x100 5h%x100 weekReset 5hReset", on every whole-% change + 30 min heartbeat, kept forever (durable; token axis = .statusline-tokens)
-PROFILE="$HSL_ANTH/profile"       # line 2: my load matrix (168 hours of the week, 0.001% of the weekly limit); line 4: burn-speed matrix (168, x100); line 6: fit|prelim; line 7: my use per ACTIVE hour, 0.001% (statusline-analyze.py)
+PROFILE="$HSL_ANTH/profile"       # line 2: my load matrix (168 hours of the week, 0.001% of the weekly limit); line 4: burn-speed matrix (168, x100); line 5: mode of each of the 168 hours; line 8: the hour's own burn factor x100; line 6: fit|prelim; line 7: my use per ACTIVE hour, 0.001% (statusline-analyze.py)
 WKRESET="$HSL_ANTH/wkreset"     # "weekly_reset_epoch epoch wk_x100": the limits were reset by hand inside that weekly window (wk% dropped >= RESET_DROP), possibly only partly (e.g. one model); wk_x100 = the value right after it
 RESET_DROP=300                                   # x100: a wk% drop this big within one weekly window = manual reset (history has 1-point backward steps = noise, ignored)
 DAILY="$HSL_ANTH/daily"       # line1: day stamp; line2: weekly burn pace over 7 days, %/h x100 or "-"
@@ -240,6 +241,7 @@ fi
 # Shows: mode icon, burn coefficient, then time until the NEXT mode in that mode's dimmed colour.
 mode_at() {   # $1 epoch -> MODE: 0 eco, 1 normal, 2 peak
     local d=$(( $1 / 86400 )) h=$(( $1 % 86400 / 3600 )) dow
+    if [ "${#MODES}" -eq 168 ]; then MODE=${MODES:$(( $1 / 3600 % 168 )):1}; return; fi
     dow=$(( (d + 3) % 7 + 1 ))
     if [ "$dow" -le "$PEAK_LAST_DOW" ] && [ "$h" -ge "$PEAK_START" ] && [ "$h" -lt "$PEAK_END" ]; then MODE=2
     elif [ "$dow" -gt "$PEAK_LAST_DOW" ] || [ "$h" -lt "$ECO_END" ]; then MODE=0
@@ -250,13 +252,16 @@ M_COL=("${E}[96m" "${E}[32m" "${E}[31m")
 M_DIM=("${E}[2;96m" "${E}[2;32m" "${E}[2;31m")
 # The mode only changes at schedule boundaries, so it is computed once and cached together with
 # the epoch of the next change; it is recomputed only when that moment passes.
-mf="$CACHE_DIR/mode"; mn=0; cur_mode=""; next_mode=""
-[ -f "$mf" ] && read -r mn cur_mode next_mode < "$mf"
-# a fresher profile may carry shifted mode boundaries (line 5: peak start, peak end, eco end, UTC hours)
-if [ -z "$next_mode" ] || [ "$now" -ge "${mn:-0}" ] || [ "$PROFILE" -nt "$mf" ]; then
+mf="$CACHE_DIR/mode"; mn=0; cur_mode=""; next_mode=""; hf_h=""; hfx=""
+[ -f "$mf" ] && { read -r mn cur_mode next_mode; read -r hf_h hfx; } < "$mf"
+# a fresher profile may carry other modes (line 5) and the per-hour burn factors (line 8, x100, 0 = no data for that hour)
+hnow=$(( now / 3600 ))
+if [ -z "$next_mode" ] || [ "$now" -ge "${mn:-0}" ] || [ "$PROFILE" -nt "$mf" ] || [ "$hf_h" != "$hnow" ]; then
+    hfx=""
     if [ -f "$PROFILE" ]; then
-        { read -r _; read -r _; read -r _; read -r _; read -r b1 b2 b3; } < "$PROFILE"
-        case "$b1$b2$b3" in ''|*[!0-9]*) ;; *) PEAK_START=$b1; PEAK_END=$b2; ECO_END=$b3 ;; esac
+        { read -r _; read -r _; read -r _; read -r _; read -r l5; read -r _; read -r _; read -r l8; } < "$PROFILE"
+        case "$l5" in ''|*[!0-9]*) ;; *) MODES=$l5 ;; esac
+        read -ra HFA <<< "$l8"; hfx=${HFA[$(( hnow % 168 ))]:--}
     fi
     mode_at "$now"; cur_mode=$MODE
     t=$(( (now / 3600 + 1) * 3600 ))
@@ -265,7 +270,7 @@ if [ -z "$next_mode" ] || [ "$now" -ge "${mn:-0}" ] || [ "$PROFILE" -nt "$mf" ];
         t=$(( t + 3600 ))
     done
     next_mode=$MODE; mn=$t
-    printf '%s %s %s\n' "$mn" "$cur_mode" "$next_mode" > "$mf"
+    printf '%s %s %s\n%s %s\n' "$mn" "$cur_mode" "$next_mode" "$hnow" "$hfx" > "$mf"
 fi
 until_next=$(( mn - now ))
 
@@ -304,14 +309,6 @@ LIM="$CACHE_DIR/lim"
 if [ -n "$seven_x100" ] && [ -n "$rwe" ]; then
     lt=0; l5=""; l5r=""; lw=""; lwr=""; [ -f "$LIM" ] && read -r lt l5 l5r lw lwr < "$LIM"
     case "$lt$lw$lwr" in ''|*[!0-9]*) lt=0 ;; esac; case "$l5$l5r" in ''|*[!0-9]*) l5=""; l5r="" ;; esac
-    # own session idle: the usage poll (statusline-analyze.py --collect -> lim-poll, same format) fills in when it is
-    # newer than the shared one; a fresh own session never looks at it, and without poll data nothing changes
-    if [ -n "$lim_stale" ] && [ -n "$HSL_OK" ] && [ -f "$HSL_RT/lim-poll" ]; then
-        read -r pt p5 p5r pw_ pwr < "$HSL_RT/lim-poll"
-        case "$pt$pw_$pwr" in ''|*[!0-9]*) ;; *)
-            if [ "$pt" -gt "${lt:-0}" ]; then lt=$pt; l5=$p5; l5r=$p5r; lw=$pw_; lwr=$pwr; case "$l5$l5r" in ''|*[!0-9]*) l5=""; l5r="" ;; esac; fi ;;
-        esac
-    fi
     lfresh=""; [ $(( now - ${lt:-0} )) -le 600 ] && [ -n "$lw" ] && lfresh=1
     if [ -z "$lim_stale" ]; then
         p5=${five_x100:--}; p5r=${r5e:--}; pw=$seven_x100
@@ -515,10 +512,10 @@ fmt_x() {   # x100 -> ".4" / "1" / "1.4" (no leading zero below 1, no ".0")
 #   work = my pace vs my own average for the same hours (rel; >1 = busier than usual); cyan <.75; red >1.5, or >1.25
 #          while the limit burns fast (burn >1.05)
 #   burn = how fast the limit burns in the current mode vs normal (1 = normal; "~" = preliminary); green <.95, red >1.05, else dim
-mf=""
+mf=""; nod=""; [ "$hfx" = 0 ] && { nod=1; seg="${E}[2m·$R"; }   # this hour has no data in the profile: a dim dot instead of the mode icon (no number)
 if [ -n "$rel" ]; then
-    case $cur_mode in 0) mf=$mfe ;; 1) mf=$mfn ;; *) mf=$mfp ;; esac
-    case "$mf" in ''|-|*[!0-9]*) mf="" ;; esac
+    case "$hfx" in ''|-) case $cur_mode in 0) mf=$mfe ;; 1) mf=$mfn ;; *) mf=$mfp ;; esac ;; *) mf=$hfx ;; esac   # this hour's own factor (data), else the mode's
+    case "$mf" in ''|0|-|*[!0-9]*) mf="" ;; esac
 fi
 # Order: burn icon + burn× + time to the next burn mode | work× (mine) | speed icon + spd× + tokens/s.
 # Without burn (no limits): work× 🐌spd× t/s. spd× = this session's t/s (5 min) ÷ the model's median, else all sessions 15 min.
@@ -534,7 +531,7 @@ wseg=""
 pv=${rel:-$b_mult}                                                       # no profile yet: old even-spend pace
 if [ -n "$pv" ]; then
     fmt_x "$pv"; red=150; [ -n "$mf" ] && [ "$mf" -gt 105 ] && red=125
-    if [ "$pv" -lt 75 ]; then pc="${E}[96m"; elif [ "$pv" -gt "$red" ]; then pc="${E}[31m"; else pc=""; fi
+    if [ "$pv" -lt 75 ]; then pc="${E}[96m"; elif [ "$pv" -gt "$red" ]; then pc="${E}[38;5;208m"; else pc=""; fi
     wseg="$pc$REPLY×$R"
 fi
 seg=$bseg; [ -n "$wseg" ] && seg="$seg $wseg"

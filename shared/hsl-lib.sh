@@ -88,22 +88,24 @@ hsl_rt() {
 
 # hsl_spd_col X100 -> REPLY = colour of a speed ratio (inverted vs burn: slow = red, fast = green)
 hsl_spd_col() {
-    if [ "$1" -lt 95 ]; then REPLY="${E}[31m"; elif [ "$1" -gt 105 ]; then REPLY="${E}[32m"; else REPLY="${E}[2m"; fi
+    if [ "$1" -lt 95 ]; then REPLY="${E}[38;5;208m"; elif [ "$1" -gt 105 ]; then REPLY="${E}[32m"; else REPLY="${E}[2m"; fi
 }
 
 # Mode block order everywhere: [burn icon burn× time-to-next-burn-mode] work× [speed icon spd× t/s [session]]
 HSL_ICON=('🐇' "${E}[33m▸$R" '🐌')                       # speed: 0 light (faster) / 1 normal / 2 busy (slower)
 
 # hsl_spd HOST SPEED_TEXT [MODEL TPS] -> REPLY = speed group, e.g. "🐌.8× 52 [48]"
-#   icon + spd× = how fast the answers are NOW vs the model's usual (its median t/s over 42 days):
-#   1) TPS of this session over the last 5 min ÷ the median of MODEL (live, every refresh);
-#   2) else the collector: all sessions on the endpoint over the last 15 min;
-#   3) else nothing to compare: "⚡SPEED_TEXT". The hour-of-week matrix is not shown (decided 2026-11-10). HSL_V = spd x100.
+#   icon + spd× = this HOUR OF THE WEEK's usual speed from the daily profile (decided 2026-11-17): the speed index (the
+#   answers' t/s vs their model's median, averaged per hour, line 3) and its load mode (line 4: 🐇 light / ▸ / 🐌 busy);
+#   '.' there = no data for that hour -> a dim dot instead of the icon, no number. SPEED_TEXT = the live t/s, as before.
+#   HSL_V (used by `work` colouring) = the LIVE ratio: 1) TPS of this session over the last 5 min ÷ the median of MODEL,
+#   2) else the collector: all sessions on the endpoint over the last 15 min; without the hour matrix the live ratio is shown
+#   as before, and without both - "⚡SPEED_TEXT".
 hsl_spd() {
     REPLY=""; HSL_V=""
-    local P="$HSL_STATE/$1/conn" l5="" v="" cur bc kv
+    local P="$HSL_STATE/$1/conn" l3="" l4="" l5="" v="" cur bc kv hv="" hm="" ico
+    [ -f "$P" ] && { read -r _; read -r _; read -r l3; read -r l4; read -r l5; } < "$P"
     case "$4" in ''|*[!0-9]*) ;; *)
-        [ -n "$3" ] && [ -f "$P" ] && { read -r _; read -r _; read -r _; read -r _; read -r l5; } < "$P"
         for kv in $l5; do
             [ "${kv%%=*}" = "$3" ] || continue
             kv=${kv#*=}; kv=${kv%%.*}
@@ -114,6 +116,16 @@ hsl_spd() {
     hsl_rt "$1"
     [ -z "$v" ] && v=$HSL_SPD
     case "$v" in ''|*[!0-9]*) v="" ;; esac
+    if [ -n "$l3" ]; then                                       # this hour of the week from the daily profile: its own norm (x100) and load mode, '.' = no data
+        local -a SA; read -ra SA <<< "$l3"; hv=${SA[$(( now / 3600 % 168 ))]}; hm=${l4:$(( now / 3600 % 168 )):1}
+    fi
+    case "$hm" in
+        .) ico="${E}[2m·$R"; HSL_V=$v; REPLY="$ico${2:+ $2}"; return ;;
+        [012]) case "$hv" in ''|*[!0-9]*) ;; *)
+                   [ -z "$v" ] && HSL_V=$hv || HSL_V=$v
+                   hsl_spd_col "$hv"; bc=$REPLY; hsl_fx "$hv"
+                   REPLY="${HSL_ICON[$hm]}$bc$REPLY×$R${2:+ $2}"; return ;; esac ;;
+    esac
     if [ -z "$v" ]; then [ -n "$2" ] && REPLY="${E}[33m⚡$R$2"; return; fi
     HSL_V=$v
     if [ "$v" -lt 92 ]; then cur=2; elif [ "$v" -gt 108 ]; then cur=0; else cur=1; fi
@@ -133,7 +145,7 @@ hsl_seg() {
     hsl_spd "$1" "$2" "$3" "$4"; sp=$REPLY
     if [ -n "$HSL_REL" ]; then
         hsl_fx "$HSL_REL"; red=150; [ -n "$HSL_V" ] && [ "$HSL_V" -lt 95 ] && red=125
-        if [ "$HSL_REL" -lt 75 ]; then pc="${E}[96m"; elif [ "$HSL_REL" -gt "$red" ]; then pc="${E}[31m"; else pc=""; fi
+        if [ "$HSL_REL" -lt 75 ]; then pc="${E}[96m"; elif [ "$HSL_REL" -gt "$red" ]; then pc="${E}[38;5;208m"; else pc=""; fi
         seg="$pc$REPLY×$R"
     fi
     [ -n "$sp" ] && seg="${seg:+$seg }$sp"

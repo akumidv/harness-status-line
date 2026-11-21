@@ -73,11 +73,14 @@ terminal shows the result.
   set of models or paid endpoints.
 - **Load modes** (only for unlimited connections): `🐌` busy (index < 0.92), `▸` normal, `🐇` light (> 1.08);
   time to the next mode as for Claude. Status `fit` (≥ 300 responses, ≥ 14 days) / `prelim` (≥ 30) / `-` (all normal).
-- **`spd` now** (decided 2026-11-10: the actual speed of the answers, not the hour of the week): the t/s of this
-  session over the last 5 min ÷ the median of its model (live, every refresh; Claude); without fresh answers in the
-  session — the mean ratio over the responses of the last 15 min on the connection (all harnesses, collector); without
-  that nothing is compared (`⚡`). The speed matrix and load modes are still computed but not shown (no `~`, no time to
-  the next load mode). Colours inverted vs `burn`: red < 0.95 (slower), green > 1.05.
+- **`spd`** (decided 2026-11-17, replaces the 2026-11-10 "live ratio only"): the coefficient and the icon are **this hour of
+  the week's** own values from the daily profile: the speed index (line 3) and its load mode (line 4); an hour with fewer
+  than 5 responses has `.` in line 4 and shows a dim dot instead of the icon, no number. The live t/s of the session stays
+  next to it (`125 [126]`). The live ratio (t/s of this session over the last 5 min ÷ the median of its model; else the
+  mean over the responses of the last 15 min on the connection, collector) is only kept for `work` colouring (orange > 1.25
+  while it is < 0.95) and as the fallback when there is no hour matrix; without both nothing is compared (`⚡`). Colours
+  inverted vs `burn`: orange < 0.95 (slower; a warning, red is only for peak `burn` and the forecast), green > 1.05. Measured 2026-11-17: the speed index by hour is flat (sd 0.05) and
+  does not correlate with the burn factor of the hour (r = −0.06; mean speed eco 99.8, normal 100.5, peak 98.0).
 - **Speed group** (every connection, Claude too): load icon `🐌` (spd < 0.92) / `▸` / `🐇` (> 1.08) + `spd×` +
   tokens/s [session] of this session; it replaces the old `⚡` (kept only when there is no load data at all). Speed is
   never mixed into `burn`: burn = limit % per token cost, speed = server load.
@@ -91,14 +94,14 @@ Claude, no limits: .8× ▸1.1× 115 [99] · day Σ5.8M
 Qwen Code:         1.5× 🐌.9× – [115] · day Σ528K · Σ 900K→12K · main
 mcode:             1.5× 🐌.9× · day Σ528K                (custom-command item, ≤ 60 columns, no speed in its stdin)
 ```
-`work` colours as for Claude (cyan < 0.75, red > 1.5, or > 1.25 while the endpoint is busy, `spd` < 0.95).
+`work` colours as for Claude (cyan < 0.75, orange > 1.5, or > 1.25 while the endpoint is busy, `spd` < 0.95).
 
 ## 6. Files
 | File | What |
 |---|---|
 | `~/.local/share/harness-status-line/statusline-analyze.py` | the one analyzer (daily + `--collect`) |
 | `~/.local/share/harness-status-line/hsl-lib.sh` | bash helpers sourced by every status line (`hsl_kick`, `hsl_conn`, `hsl_seg`, `hsl_rt`) |
-| `~/.local/state/harness-status-line/<host>/conn` | daily profile: 1 `updated billing coverage unit samples`; 2 load matrix (tokens or USD×10⁴); 3 speed matrix ×100; 4 modes (168 digits); 5 `model=tps`; 6 `fit/prelim/-` |
+| `~/.local/state/harness-status-line/<host>/conn` | daily profile: 1 `updated billing coverage unit samples`; 2 load matrix (tokens or USD×10⁴); 3 speed matrix ×100; 4 load modes (168 chars: 0 light, 1 normal, 2 busy, `.` no data); 5 `model=tps`; 6 `fit/prelim/-` |
 | `~/.local/state/harness-status-line/connections.json` | summary for inspection |
 | `~/.local/state/harness-status-line/collect-state.json` | collector state (Claude transcript offsets, last 26 h) |
 | `/tmp/hsl-$UID/rt-<host>` | `epoch work spd n today unit billing last_response` |

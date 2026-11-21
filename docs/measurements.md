@@ -22,7 +22,9 @@
 - Accuracy checked on synthetic data; the mode-change indicator (`regime_change`) is unreliable — treat it as a number only.
 
 ## Where to look
-`~/.local/state/harness-status-line/api.anthropic.com/profile.json` → `burn_factors` (`status`, `grid`, `schedule_utc`, `mode_factors`, `cv_error_vs_flat`, `factors_by_hour_utc`, `pairs/days/cost_usd_in_wk_pairs`).
+**Reviews with conclusions** (mode/hour/weekday/weekend burn, timezone test, speed vs burn, context size vs burn, token-type weights, web sources): `docs/analyses/README.md`; the scripts are in `docs/analyses/`; dated raw outputs are outside git, in `~/.local/state/harness-status-line/analyses/results/`.
+
+`~/.local/state/harness-status-line/api.anthropic.com/profile.json` → `burn_factors` (`status`, `grid`, `schedule_utc` (windows + hourly factors), `mode_factors`, `cv_error_vs_flat`, `factors_by_hour_utc`, `pairs/days/cost_usd_in_wk_pairs`).
 
 `python3 -I ~/.local/share/harness-status-line/statusline-analyze.py --burn` — a read-only look at the raw axes without the fit: the %/$ index per mode, 3-hour UTC block, weekday and day for both limits (each interval between samples of one weekly window ≤ 90 min is spread over its hours by cost; outside-use hours are skipped; bootstrap CI over whole days). The limit has whole-% resolution (1% of the week ≈ $10), so small groups are noise. First reading (4 days, 2026-11-09..12): the weekly limit burns at a constant ≈0.093 %/$ across days (index 0.91–1.05, any model mix); the apparent mode/hour effects (peak 0.81, eco 1.67) are within the noise, and the 5h limit's early-hours excess (03–09 UTC, ×2–4) looks like unflagged use on another machine. Re-read after ≥14 days.
 

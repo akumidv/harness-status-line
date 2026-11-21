@@ -1,3 +1,18 @@
 __pycache__/
 *.bak-hsl-*
 .DS_Store
+
+# Raw data and raw outputs never go into the repository (they live in ~/.local/state/harness-status-line/):
+# the limit/token axes, caches, imported transcripts, analysis outputs; only docs/analyses/README.md and the scripts are tracked.
+docs/analyses/results/
+**/history
+**/history.bak*
+**/tokens
+**/tokens.*
+**/tokens@*
+**/analyze-state.json
+**/measures.jsonl
+**/profile.json
+**/imports/
+*.jsonl
+*.prof

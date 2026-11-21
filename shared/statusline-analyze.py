@@ -26,14 +26,14 @@ Run in the background once a day by statusline-command.sh. stdlib only.
 usage: statusline-analyze.py [--wk-x100 N --reset EPOCH]   (override calibration, for tests; not persisted)
        statusline-analyze.py --burn   (read-only report: does the burn rate differ by hour / mode / weekday / day?)
 """
-import bisect, collections, datetime, fcntl, glob, itertools, json, os, random, re, sys, time, urllib.error, urllib.request
+import bisect, collections, datetime, fcntl, glob, itertools, json, os, random, re, sys, time
 
-CLAUDE = os.path.expanduser('~/.claude')                         # the harness's own dir: transcripts + credentials only, nothing of ours is kept there
+CLAUDE = os.path.expanduser('~/.claude')                         # the harness's own dir: transcripts only, nothing of ours is kept there
 PROJECTS = os.path.join(CLAUDE, 'projects')
 HOME = os.path.expanduser('~')
 HSL_STATE = os.path.join(HOME, '.local/state/harness-status-line')        # durable data; one folder per CONNECTION (provider = endpoint host)
 ANTHROPIC = 'api.anthropic.com'
-ANTH_DIR = os.path.join(HSL_STATE, ANTHROPIC)                    # the Claude account (limited connection): limit axis, token axis, cost profile, usage poll
+ANTH_DIR = os.path.join(HSL_STATE, ANTHROPIC)                    # the Claude account (limited connection): limit axis, token axis, cost profile
 STATE = os.path.join(ANTH_DIR, 'analyze-state.json')
 OUT = os.path.join(ANTH_DIR, 'profile')
 MEASURES = os.path.join(ANTH_DIR, 'measures.jsonl')              # one record per completed UTC day (long-term log)
@@ -54,16 +54,9 @@ SLOT, SLOTS = 3600, 168          # 1-hour grid; 168 slots = one week. slot index
 KEEP_DAYS, PROFILE_DAYS, FROZEN_DAYS = 15, 14, 120   # frozen = per-slot cost kept after per-message detail expires
 HSL_CFG = os.path.join(HSL_STATE, 'config.json')                  # optional overrides (billing, prices); the old ~/.config/harness-status-line/connections.json is read when this one is missing
 HSL_CFG_OLD = os.path.join(HOME, '.config/harness-status-line/connections.json')
-# LIMIT POLL: an idle CLI session keeps the limits of its last response and the VS Code extension has no status line, so
-# the limit axis had gaps. --collect asks the account's usage endpoint (the one behind /usage; undocumented) with the
-# OAuth access token of ~/.claude/.credentials.json: read in memory only, never printed, stored or refreshed (Claude
-# Code refreshes it; an expired token = no poll). Rows go to HISTORY in the status line's format. Failures back off.
-USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
-CREDENTIALS = os.path.join(CLAUDE, '.credentials.json')
-POLL_MIN, POLL_MAX_BACKOFF, POLL_HEARTBEAT = 240, 3600, 1800   # seconds between polls; backoff cap; a row at least this often
-POLL_REFUSED = (401, 403, 429)                                   # HTTP refusals: 3 tries with a growing wait, then hourly; they never write the stop file
-POLL_STOP_AFTER, COLLECT_STOP_AFTER = 3, 3                      # consecutive other HTTP errors / collector crashes before it stops for good
+COLLECT_STOP_AFTER = 3                                           # consecutive collector crashes before it stops for good
 SPEED_DAYS = 42                  # speed matrix window (needs more weeks than the load: one hour of the week = 1 sample/week)
+SPEED_MIN_N = 5                  # an hour of the week with fewer responses than this has no speed data ('.' in the modes line)
 SPEED_K = 4.0                    # pseudo-requests at index 1 per hour of the week (shrinkage of the speed matrix)
 MIN_OUT, MIN_DUR = 50, 1.0       # a response counts for speed only from 50 output tokens and 1 s
 BUSY, LIGHT = 0.92, 1.08         # speed index thresholds of the load modes (busy = slower than usual)
@@ -100,14 +93,22 @@ def cost(u, p):
 
 
 DEFAULT_SCHED = (13, 19, 8)     # UTC hours: peak start, peak end, eco end (weekdays); weekends = eco
-SCHED = list(DEFAULT_SCHED)     # may be shifted by analyze_factors() when recent data clearly supports it
+SCHED = list(DEFAULT_SCHED)
 RECENT_DAYS = 42                # factors and boundaries are fitted on the most recent weeks only
-SHIFT = 2                       # boundaries are searched within +-SHIFT hours of the default
 PRELIM_PAIRS, PRELIM_LAMBDA = 8, 8.0   # preliminary mode factors: min wk pairs, shrinkage toward 1
-SHIFT_MARGIN = 0.93             # a shifted schedule must cut the CV error by >7% vs the default one
+HOUR_LAMBDA = 0.3               # ridge of the hour-of-day fit (pulls an hour toward 'average' when it has little cost)
+HOUR_MIN_USD = 10.0             # an hour (smoothed over +-1 h, weekday/weekend apart) with less cost than this has no data
+MODE_BAND = 0.15                # factor >= 1+band -> peak, <= 1-band -> eco, between -> normal
+MODEMAP = None                  # mode per week slot (epoch hour % 168), derived from the data; None = the default schedule
 
 
-def mode_of(t):   # same schedule as the status line (UTC): 2 peak, 0 eco, 1 normal
+def mode_of(t):   # the status line's modes (UTC): 2 peak, 0 eco, 1 normal; from the data (MODEMAP), else the default schedule
+    if MODEMAP:
+        return MODEMAP[int(t) // 3600 % SLOTS]
+    return default_mode_of(t)
+
+
+def default_mode_of(t):   # the published schedule: peak weekdays 13-19 UTC, eco weekends + weekdays before 08
     d, h = int(t) // 86400, int(t) % 86400 // 3600
     dow = (d + 3) % 7 + 1
     if dow <= 5 and SCHED[0] <= h < SCHED[1]:
@@ -237,51 +238,91 @@ def cv_error(pairs, name, lam_rel, k=5, binmap=None):
     return tot
 
 
+def derive_hourly(pairs):
+    """Modes and factors FROM THE DATA, per hour of the week (weekday / weekend apart): the burn per $ of every hour of
+    the day (ridge fit, then averaged over the hour and its two neighbours, weighted by cost). An hour is peak if its factor
+    is >= 1+MODE_BAND, eco if <= 1-MODE_BAND, else normal; an hour with too little cost has no data and keeps the default
+    schedule's mode (factor 0 = unknown). Sets MODEMAP. Returns None when there is nothing to fit."""
+    global MODEMAP
+    MODEMAP = None
+    if sum(1 for p in pairs if p['lim'] == 'wk') < PRELIM_PAIRS:
+        return None
+    bm = [_dh(sw)[2] * 24 + _dh(sw)[0] for sw in range(SLOTS)]
+    th = fit_grid(pairs, bm, 48, HOUR_LAMBDA)
+    cost = [0.0] * 48
+    for p in pairs:
+        for sw, v in p['cs'].items():
+            cost[bm[sw]] += v
+    nb = lambda b, j: b // 24 * 24 + (b % 24 + j) % 24
+    f = []
+    for b in range(48):
+        c = sum(cost[nb(b, j)] for j in (-1, 0, 1))
+        f.append(sum(cost[nb(b, j)] * th[nb(b, j)] for j in (-1, 0, 1)) / c if c >= HOUR_MIN_USD else None)
+    have = sorted((f[b], sum(cost[nb(b, j)] for j in (-1, 0, 1))) for b in range(48) if f[b] is not None)
+    half, acc, ref = sum(w for _, w in have) / 2.0, 0.0, 1.0
+    for v_, w_ in have:                                   # 1.0 = the TYPICAL hour (cost-weighted median of the hours with data)
+        acc += w_
+        if acc >= half:
+            ref = v_ or 1.0
+            break
+    hf, mm = [0] * SLOTS, []
+    for sw in range(SLOTS):
+        v = f[bm[sw]]
+        if v is None:
+            mm.append(1)                                   # no data: neutral normal (decided 2026-11-17; the published peak was removed for Claude Code)
+            continue
+        v = min(max(v / ref, 0.3), 3.0)
+        hf[sw] = int(round(v * 100))
+        mm.append(2 if v >= 1 + MODE_BAND else 0 if v <= 1 - MODE_BAND else 1)
+    MODEMAP = mm
+    th3 = fit_grid(pairs, mm, 3, 0.3)
+    c3 = [0.0] * 3
+    for p in pairs:
+        for sw, v in p['cs'].items():
+            c3[mm[sw]] += v
+    ref = th3[1] if c3[1] > 0 and th3[1] > 0 else (sum(t * c for t, c in zip(th3, c3)) / (sum(c3) or 1.0) or 1.0)
+    mfac = [round(min(max(th3[m] / ref, 0.3), 3.0), 2) if c3[m] > 0 else 1.0 for m in range(3)]
+    runs = {'weekday': {}, 'weekend': {}}                 # mode -> windows (UTC hours) of the days, where there is data
+    for we, dt in ((0, 'weekday'), (1, 'weekend')):
+        row = [None if f[we * 24 + h] is None else (2 if f[we * 24 + h] / ref >= 1 + MODE_BAND else 0 if f[we * 24 + h] / ref <= 1 - MODE_BAND else 1) for h in range(24)]
+        h = 0
+        while h < 24:
+            if row[h] is None:
+                h += 1
+                continue
+            e = h
+            while e + 1 < 24 and row[e + 1] == row[h]:
+                e += 1
+            runs[dt].setdefault(('eco', 'normal', 'peak')[row[h]], []).append('%02d-%02d' % (h, e + 1))
+            h = e + 1
+    return {'hourly_x100': hf, 'mode_factors': mfac, 'windows_utc': runs,
+            'hourly_factor_utc': {dt: [round(f[we * 24 + h] / ref, 2) if f[we * 24 + h] is not None else None for h in range(24)]
+                                  for we, dt in ((0, 'weekday'), (1, 'weekend'))}}
+
+
 def analyze_factors(samples, buckets, mean, min_pairs=150, min_cost=100.0, min_days=14, n_perm=20, skip=()):
     """Pick the time grid the data supports (cross-validated by day-blocks), fit it, report factors per week slot."""
-    res = {'status': 'insufficient data', 'grid': None, 'factors_slot': None, 'mode_factors': [None] * 3}
+    res = {'status': 'insufficient data', 'grid': None, 'factors_slot': None, 'mode_factors': [None] * 3, 'prelim': False}
     pairs = build_pairs(samples, buckets, skip)
     if pairs:
         last = max(p['day'] for p in pairs)
         pairs = [p for p in pairs if p['day'] > last - RECENT_DAYS]
-    SCHED[:] = DEFAULT_SCHED
-    res['schedule_utc'] = {'peak_start': SCHED[0], 'peak_end': SCHED[1], 'eco_end': SCHED[2], 'shifted': False}
+    hr = derive_hourly(pairs)
+    res['hourly_x100'] = hr['hourly_x100'] if hr else None
+    res['schedule_utc'] = ({'source': 'data (hours with cost >= $%g around them; the rest are neutral normal)' % HOUR_MIN_USD,
+                            'modes': hr['windows_utc'], 'factor_by_hour': hr['hourly_factor_utc']}
+                           if hr else {'source': 'default (too little data)', 'peak_start': DEFAULT_SCHED[0], 'peak_end': DEFAULT_SCHED[1], 'eco_end': DEFAULT_SCHED[2]})
     days = len({p['day'] for p in pairs})
     cost = sum(sum(p['cs'].values()) for p in pairs if p['lim'] == 'wk')
     res.update(pairs=len(pairs), days=days, cost_usd_in_wk_pairs=round(cost, 1),
                need='>=%d pairs, >=$%d, >=%d days' % (min_pairs, min_cost, min_days))
     if len(pairs) < min_pairs or cost < min_cost or days < min_days:
-        # PRELIMINARY factors from what there is: a heavily shrunk fit (prior = 1), clipped to a sane range
-        wk = [p for p in pairs if p['lim'] == 'wk']
-        if len(wk) >= PRELIM_PAIRS:
-            bm = [mode_of(sw * SLOT) for sw in range(SLOTS)]
-            th = fit_grid(pairs, bm, 3, PRELIM_LAMBDA)
-            ref = th[1] or 1.0
-            f = [min(max(t / ref, 0.6), 1.6) for t in th]
-            res['mode_factors'] = [round(min(f[0], 1.0), 2), 1.0, round(max(f[2], 1.0), 2)]   # prelim only: eco is never dearer, peak never cheaper than normal
-            res['status'] = 'preliminary (%d pairs, shrunk toward 1)' % len(wk)
+        # PRELIMINARY: what the data say so far, not clamped (the status line marks it with '~')
+        if hr:
+            res['mode_factors'] = hr['mode_factors']
+            res['status'] = 'preliminary (%d wk pairs; factors and modes from the data, not validated)' % sum(1 for p in pairs if p['lim'] == 'wk')
             res['prelim'] = True
         return res
-    # ---- have the mode boundaries moved? try +-SHIFT hours around the default; keep a shift only if it is clearly better ----
-    def sched_err():
-        return cv_error(pairs, 'schedule3', 3.0)
-    base_err = sched_err()
-    best_err, best_s = base_err, tuple(DEFAULT_SCHED)
-    for ps in range(DEFAULT_SCHED[0] - SHIFT, DEFAULT_SCHED[0] + SHIFT + 1):
-        for pe in range(DEFAULT_SCHED[1] - SHIFT, DEFAULT_SCHED[1] + SHIFT + 1):
-            for ee in range(DEFAULT_SCHED[2] - SHIFT, DEFAULT_SCHED[2] + SHIFT + 1):
-                if not (ee < ps < pe) or (ps, pe, ee) == tuple(DEFAULT_SCHED):
-                    continue
-                SCHED[:] = (ps, pe, ee)
-                e = sched_err()
-                if e < best_err:
-                    best_err, best_s = e, (ps, pe, ee)
-    if best_s != tuple(DEFAULT_SCHED) and best_err < base_err * SHIFT_MARGIN:
-        SCHED[:] = best_s
-        res['schedule_utc'] = {'peak_start': best_s[0], 'peak_end': best_s[1], 'eco_end': best_s[2], 'shifted': True,
-                               'cv_error_vs_default': round(best_err / (base_err or 1.0), 3)}
-    else:
-        SCHED[:] = DEFAULT_SCHED
     cv, best_lam = {}, {}
     for name in GRIDS:
         if name == 'flat':
@@ -339,8 +380,9 @@ def analyze_factors(samples, buckets, mean, min_pairs=150, min_cost=100.0, min_d
     if 'schedule3' in best_lam:                                       # the 3 modes of the assumed schedule, for the fallback display
         f3 = slot_factors('schedule3')
         res['mode_factors'] = [round(f3[next(sw for sw in range(SLOTS) if mode_of(sw * SLOT) == m)], 2) for m in range(3)]
-        if chosen == 'flat':
-            res['mode_factors'] = [1.0, 1.0, 1.0]                      # no time-of-day effect detected
+        if hr:                                                         # shown even when no time-of-day effect passed the check ('~')
+            res['mode_factors'] = hr['mode_factors']
+            res['prelim'] = res['prelim'] or chosen == 'flat'
     # ---- did the regime change? needs >= 28 days: older-half model vs newer data ----
     span = max(p['day'] for p in pairs) - min(p['day'] for p in pairs)
     res['span_days'] = span
@@ -805,7 +847,7 @@ def speed_fit(R, now):
     n = sum(s_n)
     days = len({int(t) // 86400 for t, m, _ in sp if m in base})
     status = 'fit' if n >= 300 and days >= 14 else ('prelim' if n >= 30 else '-')
-    return base, idx, n, days, status
+    return base, idx, n, days, status, s_n
 
 
 def write_conn_profiles(now, msgs):
@@ -831,10 +873,10 @@ def write_conn_profiles(now, msgs):
                 tot[sl % SLOTS] += (r[7] or 0.0) * 10000 if unit == 'usd' else r[4]
         L = [int(round(tot[i] / occ[i])) if occ[i] else 0 for i in range(SLOTS)]
         ar, ahrs = active_rate([(r[0], (r[7] or 0.0) * 10000 if unit == 'usd' else r[4]) for r in rs], cov0, cur)
-        base, idx, n, days, status = speed_fit(rs, now)
+        base, idx, n, days, status, s_n = speed_fit(rs, now)
         if status == '-':
             idx = [1.0] * SLOTS
-        modes = ''.join('2' if x < BUSY else ('0' if x > LIGHT else '1') for x in idx)
+        modes = ''.join('.' if status == '-' or s_n[i] < SPEED_MIN_N else ('2' if x < BUSY else ('0' if x > LIGHT else '1')) for i, x in enumerate(idx))   # '.' = no data for that hour
         base_s = ' '.join('%s=%d' % (re.sub(r'\s', '_', m), round(v)) for m, v in sorted(base.items())) or '-'
         os.makedirs(os.path.join(HSL_STATE, key), exist_ok=True)
         p = os.path.join(HSL_STATE, key, 'conn')
@@ -888,171 +930,6 @@ def atomic_write(p, text):
     with open(p + '.%d' % os.getpid(), 'w') as f:
         f.write(text)
     os.replace(p + '.%d' % os.getpid(), p)
-
-
-def sl_cache_dir():
-    """The status line's cache dir (tmpfs, else its own fallback) or None."""
-    d = '/tmp/claude-sl-%d' % os.getuid()
-    try:
-        if os.path.islink(d) or not os.path.isdir(d) or os.stat(d).st_uid != os.getuid():
-            d = os.path.join(HSL_STATE, 'cache')
-            if not os.path.isdir(d):
-                return None
-        return d
-    except OSError:
-        return None
-
-
-def sync_hist_last(now, wk, fv, r5, rw):
-    """Tell the CLI status lines about the row just appended: their writers compare against $CACHE_DIR/hist-last
-    ("epoch 5h% wk% rwe wk_x100 5h_x100 r5e") so that a stale lower value is not appended after this one."""
-    d = sl_cache_dir()
-    try:
-        if not d:
-            return
-        p = os.path.join(d, 'hist-last')
-        try:
-            f = open(p).read().split()
-        except OSError:
-            f = []
-        h5 = f[5] if len(f) > 6 and f[5].isdigit() and f[6].isdigit() else '-'      # an unknown 5h keeps the last known one
-        h5r = f[6] if h5 != '-' else '-'
-        hf = f[1] if len(f) > 1 else '-'
-        if fv is not None and r5:
-            hf, h5, h5r = str((fv + 50) // 100), str(fv), str(r5)
-        atomic_write(p, '%d %s %d %d %d %s %s\n' % (now, hf, (wk + 50) // 100, rw, wk, h5, h5r))
-    except OSError:
-        pass
-
-
-POLL_STOP_FILE = 'usage-poll-stopped.lock'                      # in ANTH_DIR; while it exists nothing polls; its text is the reason
-
-
-def poll_read(sp):
-    """usage-poll state: "next_try_epoch fails last_status strikes"; stopped = the stop file exists."""
-    try:
-        f = open(sp).read().split()
-    except OSError:
-        f = []
-    num = lambda i: int(f[i]) if len(f) > i and f[i].lstrip('-').isdigit() else 0
-    return num(0), num(1), (f[2] if len(f) > 2 else '-'), num(3), os.path.exists(os.path.join(os.path.dirname(sp), POLL_STOP_FILE))
-
-
-def poll_usage(now):
-    """One poll of the usage endpoint -> a HISTORY row (on a whole-% change, a new window or the 30-min heartbeat).
-    Stopped completely while the stop file `usage-poll-stopped` exists (it holds the reason). Never asks twice: it is skipped while the status lines (= the headers of the sessions' own API responses) hold fresh
-    limits, while another process is polling or polled < POLL_MIN ago (cron, status lines of any number of sessions share
-    one lock + one timer). A refusal (401/403/429) is retried with a growing wait (8/16/32 min), then once an hour, and never stops it; the stop file is written after POLL_STOP_AFTER consecutive other HTTP errors /
-    unusable answers (no request from cron or any status line after that, until `--resume` or the file is deleted); network
-    errors and an expired token only back off (nothing reached the server). Only the sessions' own responses are recorded then."""
-    os.makedirs(ANTH_DIR, exist_ok=True)
-    sp = os.path.join(ANTH_DIR, 'usage-poll')
-    nt, fails, st0, strikes, stopped = poll_read(sp)
-    if stopped or now < nt:
-        return
-    d_ = sl_cache_dir()
-    try:                                                         # a session's own response limits are fresh -> nothing to ask
-        if d_ and now - int(open(os.path.join(d_, 'lim')).read().split()[0]) < POLL_MIN:
-            return
-    except (OSError, ValueError, IndexError):
-        pass
-    lk = open(os.path.join(ANTH_DIR, 'usage-poll.mutex'), 'w')
-    try:
-        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return                                                   # another process is asking right now
-    nt, fails, st0, strikes, stopped = poll_read(sp)             # re-read under the lock: someone may have just polled
-    if stopped or now < nt:
-        return
-    atomic_write(sp, '%d %d %s %d\n' % (now + POLL_MIN, fails, st0, strikes))        # claim the slot before asking
-    def done(kind, status, detail=''):
-        f_, s_, stop = fails, strikes, False
-        if kind == 'ok':
-            f_, s_, wait = 0, 0, POLL_MIN
-        elif kind == 'soft':                                     # no / expired token: not asked, not an error
-            wait = POLL_MIN
-        else:
-            f_ += 1
-            wait = min(POLL_MIN * 2 ** min(f_, 10), POLL_MAX_BACKOFF)
-            if kind == 'http' and status in POLL_REFUSED:        # 401/403/429: may pass by itself (token rotation, rate limit): 3 tries with a growing wait (8/16/32 min), then once an hour, never stopped for good
-                pass
-            elif kind in ('http', 'bad'):
-                s_ += 1
-                stop = s_ >= POLL_STOP_AFTER                     # any other HTTP error / unusable answer: three in a row
-        atomic_write(sp, '%d %d %s %d\n' % (now + wait, min(f_, 10), status, s_))
-        if stop:
-            atomic_write(os.path.join(ANTH_DIR, POLL_STOP_FILE),
-                         'stopped: %s UTC\nreason: %s%s (GET %s)\nrule: any HTTP error other than 401/403/429 (those are retried hourly) or unusable answer, %d in a row (this was #%d)\n'
-                         'effect: no usage requests from cron or any status line; only the sessions\' own response limits are recorded\n'
-                         'resume: python3 -I %s --resume   (or delete this file)\n' % (
-                             datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-                             status, (' ' + detail) if detail else '', USAGE_URL, POLL_STOP_AFTER, s_, os.path.abspath(__file__)))
-    try:
-        o = json.load(open(CREDENTIALS)).get('claudeAiOauth') or {}
-        tok = o.get('accessToken')
-        if not tok or (o.get('expiresAt') or 0) / 1000.0 < now + 60:
-            return done('soft', 'no-token')                      # Claude Code renews it on its next use
-        req = urllib.request.Request(USAGE_URL, headers={'Authorization': 'Bearer ' + tok, 'anthropic-beta': 'oauth-2025-04-20',
-                                                         'User-Agent': 'harness-status-line'})
-        d = json.loads(urllib.request.urlopen(req, timeout=8).read().decode())
-    except urllib.error.HTTPError as e:
-        try:                                                     # the server's own explanation (error JSON, www-authenticate), never our request; long tokens-like strings masked
-            body = e.read(400).decode('utf-8', 'replace')
-        except Exception:
-            body = ''
-        hdr = ' '.join('%s=%s' % (k, e.headers.get(k)) for k in ('server', 'www-authenticate', 'retry-after') if e.headers.get(k))
-        info = re.sub(r'[A-Za-z0-9_.\-]{30,}', '...', ' '.join(('%s %s [%s]' % (e.reason, body, hdr)).split()))
-        return done('http', e.code, info[:300])
-    except Exception:
-        return done('net', 'error')
-    tok = req = None
-
-    def part(k):
-        v = d.get(k) or {}
-        try:
-            r = datetime.datetime.fromisoformat(v['resets_at']).timestamp()
-            return int(round(float(v['utilization']) * 100)), int(round(r / 60.0)) * 60   # the CLI rows are whole minutes
-        except Exception:
-            return None, None
-    wk, rw = part('seven_day')
-    fv, r5 = part('five_hour')
-    if wk is None or not rw or rw <= now:
-        return done('bad', 'bad-data', 'unusable answer: no usable seven_day utilization / reset')
-    if fv is None or not r5 or r5 <= now:
-        fv, r5 = None, None                                      # no active 5h window
-    try:                                                         # fresh server-side limits for a status line whose own are stale
-        rt = rt_dir()
-        if rt:
-            atomic_write(os.path.join(rt, 'lim-poll'), '%d %s %s %d %d\n' % (now, fv if fv is not None else '-', r5 or '-', wk, rw))
-    except OSError:
-        pass
-    last = None
-    try:
-        with open(HISTORY, 'rb') as f:
-            f.seek(0, 2)
-            f.seek(max(0, f.tell() - 4096))
-            ls = f.read().decode('utf-8', 'replace').strip().split('\n')
-        last = ls[-1].split() if ls else None
-    except OSError:
-        pass
-    write = True
-    if last and len(last) >= 4 and last[0].isdigit() and last[3].isdigit():
-        lt, lwk, lrw = int(last[0]), int(last[1]), int(last[3])
-        l5 = int(last[2]) if last[2].isdigit() else None
-        l5r = int(last[4]) if len(last) > 4 and last[4].isdigit() else None
-        if rw < lrw:
-            write = False                                        # an older weekly window than the last row: not ours to add
-        elif now - lt < POLL_HEARTBEAT and rw == lrw and wk // 100 == lwk // 100 and (fv is None or (l5r == r5 and l5 is not None and fv // 100 == l5 // 100)):
-            write = False                                        # no whole-% change inside the same windows
-    if write:
-        line = '%d %d %s %d %s\n' % (now, wk, fv if fv is not None else '-', rw, r5 if r5 else '-')
-        fd = os.open(HISTORY, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        try:
-            os.write(fd, line.encode())
-        finally:
-            os.close(fd)
-        sync_hist_last(now, wk, fv, r5, rw)
-    done('ok', 'ok')
 
 
 def collect_main():
@@ -1325,6 +1202,12 @@ def burn_report():
     (HISTORY + TOKENS): every interval between consecutive samples of ONE weekly window (<= 90 min) is spread over its
     hours by the cost spent in them. Index 1.00 = the average. The limit has whole-% resolution (1% of the week ~ $10),
     so a group needs a few $100 before its index means anything; the CI is a bootstrap over whole days."""
+    global MODEMAP
+    try:                                                          # the modes the status line shows (profile line 5), else the default schedule
+        l5 = open(OUT).read().split('\n')[4].strip()
+        MODEMAP = [int(c) for c in l5] if len(l5) == SLOTS and l5.isdigit() else None
+    except (OSError, IndexError, ValueError):
+        MODEMAP = None
     B = collections.defaultdict(float)
     for r in read_tokens():
         B[r[0] // TOK_BUCKET] += sum(x * y for x, y in zip(r[5], price_for(r[1]))) / 1e6
@@ -1370,7 +1253,7 @@ def burn_report():
         datetime.datetime.fromtimestamp(S[-1][0], datetime.timezone.utc).strftime('%m-%d %H:%M'), len(days), len(flagged)))
     if len(days) < 14:
         print('NOTE: %d days - the fit of mode factors needs >= 14; read the groups below as a hint, not a result' % len(days))
-    groups = [('mode (eco / normal / peak, UTC schedule)', lambda r: r[2], lambda k: ('eco', 'normal', 'peak')[k]),
+    groups = [('mode (eco / normal / peak, as in the profile)', lambda r: r[2], lambda k: ('eco', 'normal', 'peak')[k]),
               ('UTC hour block', lambda r: r[1] // 3 * 3, lambda k: '%02d-%02d' % (k, k + 3)),
               ('weekday', lambda r: (r[0] + 3) % 7, lambda k: DOW[k]),
               ('day', lambda r: r[0], lambda k: '%s %s' % (datetime.date.fromtimestamp(k * 86400).isoformat(), dow(k)))]
@@ -1406,15 +1289,13 @@ def burn_report():
 
 
 def collect_guarded():
-    """--collect, the one entry for cron and the status lines: collector + usage poll. A crash is counted; after
+    """--collect, the one entry for cron and the status lines: the collector. A crash is counted; after
     COLLECT_STOP_AFTER in a row it stops for good (the status lines then do not even start it) until `--resume`."""
     stop, fp = os.path.join(HSL_STATE, 'collect-stopped.lock'), os.path.join(HSL_STATE, 'collect-fails')
     if os.path.exists(stop):
         return
     try:
         collect_main()
-        os.makedirs(HSL_STATE, exist_ok=True)
-        poll_usage(int(time.time()))
     except Exception as e:
         try:
             os.makedirs(HSL_STATE, exist_ok=True)
@@ -1425,7 +1306,7 @@ def collect_guarded():
             msg = '%s: %s' % (type(e).__name__, str(e)[:160].replace('\n', ' '))
             atomic_write(fp, '%d %d %s\n' % (n, time.time(), msg))
             if n >= COLLECT_STOP_AFTER:
-                atomic_write(stop, 'stopped: %s UTC\nreason: %s (crash #%d in a row)\neffect: the collector (activity, work/spd) and the usage poll do not run; the status lines still record their own response limits\nresume: python3 -I %s --resume   (or delete this file)\n' % (
+                atomic_write(stop, 'stopped: %s UTC\nreason: %s (crash #%d in a row)\neffect: the collector (activity, work/spd) does not run; the status lines still record their own response limits\nresume: python3 -I %s --resume   (or delete this file)\n' % (
                     datetime.datetime.fromtimestamp(time.time(), datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), msg, n, os.path.abspath(__file__)))
         except Exception:
             pass
@@ -1437,8 +1318,7 @@ def collect_guarded():
 
 
 def health():
-    """--health: the state of the collector and the usage poll (no network, nothing written)."""
-    now = time.time()
+    """--health: the state of the collector (nothing written)."""
     def rd(n, d=HSL_STATE):
         try:
             return open(os.path.join(d, n)).read().strip()
@@ -1446,18 +1326,6 @@ def health():
             return ''
     print('collector: %s' % ('STOPPED: %s' % rd('collect-stopped.lock') if rd('collect-stopped.lock') else
                              'ok' if not rd('collect-fails') else 'failing (%s)' % rd('collect-fails')))
-    nt, fails, st, strikes, stopped = poll_read(os.path.join(ANTH_DIR, 'usage-poll'))
-    print('usage poll: %s | last status %s | consecutive failures %d, errors in a row %d/%d | next try %s' % (
-        'STOPPED' if stopped else 'running', st, fails, strikes, POLL_STOP_AFTER,
-        'never (until resumed)' if stopped else 'in %d s' % max(0, nt - now) if nt else '-'))
-    if stopped:
-        print('  ' + rd(POLL_STOP_FILE, ANTH_DIR).replace('\n', '\n  '))
-    d = sl_cache_dir()
-    try:
-        age = now - int(open(os.path.join(d, 'lim')).read().split()[0])
-        print('limits from the sessions: %d s old (%s)' % (age, 'fresh, no poll needed' if age < POLL_MIN else 'stale, the poll may ask'))
-    except Exception:
-        print('limits from the sessions: none')
     if rd('collect-stopped.lock'):
         print('-> `python3 -I %s --resume` after fixing the cause' % os.path.abspath(__file__))
 
@@ -1471,12 +1339,12 @@ def main():
         health()
         return
     if '--resume' in sys.argv[1:]:
-        for d, n in ((HSL_STATE, 'collect-stopped.lock'), (HSL_STATE, 'collect-fails'), (ANTH_DIR, 'usage-poll'), (ANTH_DIR, POLL_STOP_FILE)):
+        for d, n in ((HSL_STATE, 'collect-stopped.lock'), (HSL_STATE, 'collect-fails')):
             try:
                 os.remove(os.path.join(d, n))
             except OSError:
                 pass
-        print('resumed: collector and usage poll errors cleared')
+        print('resumed: collector errors cleared')
         return
     if '--collect' in sys.argv[1:]:
         collect_guarded()
@@ -1552,7 +1420,9 @@ def main():
     mf = analyze_factors(read_samples(), buckets, mean, skip=o_flag)
     fm = mf['mode_factors']
     fac = [x if x is not None else 1.0 for x in fm]                    # eco, norm, peak; 1 until anything is known
-    wb = {sl_: c_ * fac[mode_of(sl_ * SLOT)] for sl_, c_ in buckets.items()}   # cost weighted by how fast each mode burns the limit
+    hx = mf.get('hourly_x100')                                         # the data's own factor of each hour of the week (x100; 0 = no data there)
+    sfac = [(hx[sw] or 100) / 100.0 if hx else fac[mode_of(sw * SLOT)] for sw in range(SLOTS)]   # burn speed of each hour of the week (1 where unknown)
+    wb = {sl_: c_ * sfac[sl_ % SLOTS] for sl_, c_ in buckets.items()}   # cost weighted by how fast its hour burns the limit: matrix 1 x matrix 2 then adds up to the real % of the week
     # ---- calibration: % of the weekly limit per USD, from this week's cost vs current wk% ----
     lim = override or last_limits()
     scale, basis = None, 'none'
@@ -1575,16 +1445,17 @@ def main():
     else:
         line2 = '-'
     line3 = ' '.join(str(int(round(x * 100))) if x is not None else '-' for x in fm)    # eco norm peak, hundredths
-    line4 = ' '.join(str(int(round(fac[mode_of(sw * SLOT)] * 100))) for sw in range(SLOTS))   # MATRIX 2 (limit burn speed): factor x100 per hour of the week
+    line4 = ' '.join(str(int(round(x * 100))) for x in sfac)   # MATRIX 2 (limit burn speed): factor x100 per hour of the week
+    line8 = ' '.join(str(x) for x in hx) if hx else '-'
     line6 = 'prelim' if mf.get('prelim') else ('fit' if mf['grid'] else '-')           # how the factors were obtained
-    line5 = '%d %d %d' % tuple(SCHED)                      # peak start, peak end, eco end (UTC hours) - the status line follows these
+    line5 = ''.join(str(mode_of(sw * SLOT)) for sw in range(SLOTS))   # the mode (0 eco, 1 normal, 2 peak) of each week slot: the status line follows these
     # line 7: MY USUAL PACE WHILE WORKING - thousandths of a % of the weekly limit per ACTIVE hour at the normal burn
     # rate (idle hours excluded, unlike matrix 1); the base of `work`. "-" until there is a calibration
     ar_usd, act_hours = active_rate([(v[8] if len(v) > 8 else v[0] * SLOT, v[1]) for v in st['msgs'].values()], cov0, cur)
     line7 = '%d' % round(ar_usd * scale * 1000) if scale and ar_usd else '-'
     tmp = OUT + '.tmp'
     with open(tmp, 'w') as f:
-        f.write('%d %s %.1f\n%s\n%s\n%s\n%s\n%s\n%s\n' % (now, ('%.6f' % scale) if scale else '-', (cur - cov0) / 24.0, line2, line3, line4, line5, line6, line7))
+        f.write('%d %s %.1f\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' % (now, ('%.6f' % scale) if scale else '-', (cur - cov0) / 24.0, line2, line3, line4, line5, line6, line7, line8))
     os.replace(tmp, OUT)
 
     # ---- token burn per model / per mode / per hour of day, over the profile window ----
@@ -1682,7 +1553,7 @@ def main():
         'cost_usd_per_hour_by_mode(eco,norm,peak)': [round(modecost[i] / modehours[i], 2) if modehours[i] else None for i in range(3)],
         'output_tokens_per_hour_by_mode(eco,norm,peak)': [round(out_by_mode[i] / modehours[i]) if modehours[i] else None for i in range(3)],
         'cost_usd_by_hour_utc_avg_per_day': [round(x / max(hours / 24.0, 1), 2) for x in by_hour],
-        'burn_factors': {k: v for k, v in mf.items() if k != 'factors_slot'},
+        'burn_factors': {k: v for k, v in mf.items() if k not in ('factors_slot', 'hourly_x100')},
         'models': models,
         'daily_measures_appended': new,
         'assumptions': 'cache write 1.25x/2x of input, Haiku 5.5 cache read 0.1x - assumed; only ratios matter',
