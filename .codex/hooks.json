@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.venv/bin/akmon\" hook codex-hook role-on-code",
+            "statusMessage": "Checking akmon role switch"
+          },
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.venv/bin/akmon\" hook codex-hook analysis-guard",
+            "statusMessage": "Checking analysis-before-mutation"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.venv/bin/akmon\" hook codex-hook session-start",
+            "statusMessage": "Loading akmon session reminders"
+          }
+        ]
+      }
+    ]
+  }
+}

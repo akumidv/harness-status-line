@@ -1,0 +1,15 @@
+# akmon integration record — written by `akmon init`, refreshed on realign.
+# The version this project sits on; a later bump diffs the CHANGELOG window against it.
+mount = "package"
+akmon_version = "0.4.0"
+attached_archetype = "unclassified"
+
+last_realign = "0.4.0"
+[test]
+# The project's own pytest invocation, used verbatim by the release check
+# (BOOTSTRAP §A5). Uncomment and set it to whatever this project already uses:
+# runner = "uv run pytest"
+
+[check]
+# What `akmon check` runs: the project's own commands, `{files}` becoming the files a run covers.
+ruff = "ruff check {files}"

@@ -1,18 +1,36 @@
+# Generic. Each component keeps its own rules in <component>/.gitignore.
 __pycache__/
-*.bak-hsl-*
 .DS_Store
+*.bak
+*.bak-*
+# Runtime state, caches and secrets of the deployed tools never come back into the repo.
+.env
+*.local.json
 
-# Raw data and raw outputs never go into the repository (they live in ~/.local/state/harness-status-line/):
-# the limit/token axes, caches, imported transcripts, analysis outputs; only docs/analyses/README.md and the scripts are tracked.
-docs/analyses/results/
-**/history
-**/history.bak*
-**/tokens
-**/tokens.*
-**/tokens@*
-**/analyze-state.json
-**/measures.jsonl
-**/profile.json
-**/imports/
-*.jsonl
-*.prof
+# Local working notes (checkpoints, handoffs): never committed.
+_aitna/.local/
+
+# secrets
+*.env
+!*.env.example
+
+# dev-layer venv (provisioned only when the project has no Python environment)
+_aitna/.venv/
+
+# local layer (machine state), ergons, worktrees and scratch — never committed
+_aitna/.ergon/
+.worktrees/
+.tmp/
+
+# akmon model routing — per-user/per-session artifacts (never committed)
+.claude/model-routing.local.json
+.claude/model-routing.log
+.claude/second-opinion/
+.codex/second-opinion/
+.qwen/second-opinion/
+.opencode/second-opinion/
+.pi/second-opinion/
+.claude/agents/k_*.md
+
+# Python dev environment (akmon package)
+.venv/

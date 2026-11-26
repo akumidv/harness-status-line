@@ -1,0 +1,39 @@
+{
+  "place": "none",
+  "title": "Dock (bash tabs under the right panel)",
+  "palette": [
+    {
+      "title": "Toggle panel terminal",
+      "command": "layout.toggle",
+      "args": {
+        "id": "panel-shell"
+      },
+      "words": "bash shell terminal dock right panel"
+    },
+    {
+      "title": "Dock: new bash tab",
+      "command": "panel-shell.new-tab",
+      "words": "bash terminal dock tab new"
+    },
+    {
+      "title": "Dock: split right",
+      "command": "panel-shell.split-right",
+      "words": "bash terminal dock split"
+    },
+    {
+      "title": "Dock: split down",
+      "command": "panel-shell.split-down",
+      "words": "bash terminal dock split"
+    },
+    {
+      "title": "Dock: close terminal",
+      "command": "panel-shell.close-pane",
+      "words": "bash terminal dock close"
+    },
+    {
+      "title": "Dock: next tab",
+      "command": "panel-shell.next-tab",
+      "words": "bash terminal dock tab next"
+    }
+  ]
+}

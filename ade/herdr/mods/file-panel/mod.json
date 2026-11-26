@@ -1,0 +1,12 @@
+{
+  "place": "none",
+  "title": "Files + preview",
+  "link_handlers": [
+    { "kind": "file", "pattern": "(?i)(\\.(md|mdx|markdown|txt|rst|adoc|org|json|jsonc|json5|ya?ml|toml|ini|cfg|conf|env|properties|js|mjs|cjs|jsx|ts|tsx|mts|cts|d\\.ts|py|pyi|ipynb|rs|go|java|kt|kts|scala|swift|c|h|cc|cpp|hpp|cs|rb|php|lua|pl|r|sh|bash|zsh|fish|ps1|psm1|bat|cmd|sql|graphql|proto|html?|css|scss|sass|less|vue|svelte|astro|xml|svg|csv|tsv|log|lock|diff|patch|tf|hcl|nix|gradle|cmake|mk|dockerfile|gitignore|gitattributes|editorconfig)|(^|/)(Dockerfile|Makefile|Justfile|LICENSE|README|AGENTS|CLAUDE|CHANGELOG)[^/]*)([:#].*)?$" },
+    { "kind": "file", "pattern": "(^|/)\\.?[^/.:#]+/?$" }
+  ],
+  "palette": [
+    { "title": "Files: show panel", "command": "file-panel.show", "words": "files tree preview open" },
+    { "title": "Files: back", "command": "file-panel.back", "words": "files preview history back" }
+  ]
+}

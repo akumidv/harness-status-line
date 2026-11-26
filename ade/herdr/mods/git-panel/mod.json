@@ -1,0 +1,24 @@
+{
+  "place": "none",
+  "cloned_from": {
+    "name": "changes",
+    "version": "0.1.18"
+  },
+  "palette": [
+    {
+      "title": "Git: Changes",
+      "command": "git-panel.changes",
+      "words": "git source control"
+    },
+    {
+      "title": "Git: History graph",
+      "command": "git-panel.history",
+      "words": "git source control"
+    },
+    {
+      "title": "Git: Branches & worktrees",
+      "command": "git-panel.branches",
+      "words": "git source control"
+    }
+  ]
+}

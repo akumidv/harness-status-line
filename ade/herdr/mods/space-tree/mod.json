@@ -1,0 +1,70 @@
+{
+  "place": "none",
+  "cloned_from": {
+    "name": "spaces",
+    "version": "0.1.18"
+  },
+  "title": "Spaces",
+  "palette": [
+    {
+      "title": "Import groups from a transfer",
+      "command": "space-tree.import-groups",
+      "words": "groups colors transfer import herdr"
+    },
+    {
+      "title": "Space: select 1st",
+      "command": "space-tree.select-1",
+      "words": "space select 1 profile switch"
+    },
+    {
+      "title": "Space: select 2nd",
+      "command": "space-tree.select-2",
+      "words": "space select 2 profile switch"
+    },
+    {
+      "title": "Space: select 3rd",
+      "command": "space-tree.select-3",
+      "words": "space select 3 profile switch"
+    },
+    {
+      "title": "Space: select 4th",
+      "command": "space-tree.select-4",
+      "words": "space select 4 profile switch"
+    },
+    {
+      "title": "Space: select 5th",
+      "command": "space-tree.select-5",
+      "words": "space select 5 profile switch"
+    },
+    {
+      "title": "Space: select 6th",
+      "command": "space-tree.select-6",
+      "words": "space select 6 profile switch"
+    },
+    {
+      "title": "Space: select 7th",
+      "command": "space-tree.select-7",
+      "words": "space select 7 profile switch"
+    },
+    {
+      "title": "Space: select 8th",
+      "command": "space-tree.select-8",
+      "words": "space select 8 profile switch"
+    },
+    {
+      "title": "Space: select 9th",
+      "command": "space-tree.select-9",
+      "words": "space select 9 profile switch"
+    },
+    {
+      "title": "Space: next in profile",
+      "command": "space-tree.next",
+      "words": "space next profile switch"
+    },
+    {
+      "title": "Space: previous in profile",
+      "command": "space-tree.prev",
+      "words": "space previous prev profile switch"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "ai-env"
+version = "0"
+source = { virtual = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "akmon" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "akmon", git = "https://github.com/akumidv/ai_akmon?rev=v0.4.0" }]
+
+[[package]]
+name = "akmon"
+version = "0.4.0"
+source = { git = "https://github.com/akumidv/ai_akmon?rev=v0.4.0#111f850c78a6cfd8373c79245bbf62e9d4f2c7be" }

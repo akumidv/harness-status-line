@@ -1,0 +1,3 @@
+# ruff with akmon's Python rules; adjust them here with extend-select, extend-ignore and
+# per-file-ignores.
+extend = "_aitna/akmon/profiles/ruff.toml"

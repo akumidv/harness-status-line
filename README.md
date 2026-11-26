@@ -1,140 +1,83 @@
-# harness-status-line
+# ai_env
 
-Status lines for terminal AI harnesses — **Claude Code**, **Qwen Code**, **Codex**, **MiniMax Code (mcode)** — a shared analyzer that reads the logs of all of them (plus the Claude VS Code extension, OpenCode, pi), and a single Python script that **extracts** the status-line parts of their configs into this repository and **deploys** them back on any machine.
+One repository with everything needed to set up my AI working environment: on a new machine
+from scratch, or to adapt an existing one. It keeps only what I wrote or tuned (scripts, config
+fragments, mods, layouts) plus a small sync tool per component that deploys it into place.
+Whole configs, keys, logs and collected data stay on the machine.
 
-The repository does not store whole configs, only the status line: scripts and small fragments (`statusLine` in `settings.json`, `[tui] status_line*` in `config.toml`, the `tui.statusLine` block in `config.yaml`). Everything else in the configs (keys, providers, projects) stays where it is and never reaches the repository.
+## Components
+
+| Folder | What it sets up | Lands in |
+|---|---|---|
+| [`harness-status-line/`](harness-status-line/README.md) | Status lines for Claude Code, Qwen Code, Codex, MiniMax Code and a shared analyzer of all harness logs (limits, burn rate, load modes) | `~/.claude`, `~/.qwen`, `~/.codex*`, `~/.minimax`, `~/.local/share/harness-status-line`, a cron line |
+| [`ade/`](ade/) | Add-ons for ADEs (agentic development environments): one subfolder per app | the app's config home |
+| [`ade/herdr/`](ade/herdr/README.md) | Herdr mods (git panel, files with preview and terminal file links, a dock of bash tabs under the right panel, a tab bar) and the `my-main` layout | `~/.config/herdr-app` |
+
+## How it works
+
+The repository is the source of truth. Work happens here; the machine gets it by deploying:
+
+```
+edit in ai_env/<component>/  ->  <sync tool> status  ->  <sync tool> deploy  ->  check it works  ->  commit
+```
+
+Every component has the same three commands in its own sync tool:
+
+- `status` — what differs between the repository and the machine;
+- `deploy [--dry-run]` — repository → machine, merging fragments into existing configs and backing up whatever it replaces;
+- `extract [--dry-run]` — machine → repository, only to bring back a change made in place (tried live first, then kept).
+
+| Component | Sync tool |
+|---|---|
+| `harness-status-line` | `python3 harness_status_line.py status\|deploy\|extract [--only <harness>]` |
+| `ade/herdr` | `python3 herdr_sync.py status\|deploy\|extract` |
+
+## New machine
+
+```bash
+git clone <this repo> ~/workspace/ai_env && cd ~/workspace/ai_env
+# Dev layer: akmon is a git-pinned dev dependency in .venv (needs uv and python >= 3.12)
+uv sync
+# Status lines (needs python3 ≥ 3.11, bash ≥ 4.2, jq, awk); see harness-status-line/README.md for the cron line
+(cd harness-status-line && python3 harness_status_line.py deploy --dry-run && python3 harness_status_line.py deploy)
+# Herdr add-ons (install Herdr first and start it once so ~/.config/herdr-app exists)
+(cd ade/herdr && python3 herdr_sync.py deploy && herdr-app do layout.switch '{"name":"my-main"}')
+# Herdr profiles (optional): the profile names/colours are local data, not in the repo
+# mkdir -p ~/.config/ai_env && cp ade/herdr/profiles.example.json ~/.config/ai_env/herdr-profiles.json   # then edit it
+```
+
+Each `deploy` can be rerun: it changes nothing when the machine is already in sync.
 
 ## Layout
 
 ```
-harness_status_line.py          # extract / deploy / status (Python 3.11+, stdlib only)
-shared/                         # -> ~/.local/share/harness-status-line
-  statusline-analyze.py         # daily analysis of all harness logs + --collect (every <=5 min)
-  hsl-lib.sh                    # bash helpers for every status line (load mode, spd, activity)
-claude/
-  statusline-command.sh         # the status line itself (bash + jq)
-  settings.fragment.json        # {"statusLine": {...}} from ~/.claude/settings.json
-AGENTS.md                       # agent instructions: what is here, how to continue
-docs/                           # requirements, architecture, measurements, roadmap
-qwen/
-  statusline-command.sh
-  settings.fragment.json        # {"ui": {"statusLine": {...}}} from ~/.qwen/settings.json
-codex/
-  codex-personal/               # per profile: ~/.codex, ~/.codex-personal
-    config.fragment.toml        # [tui] status_line, status_line_use_colors
-mcode/
-  statusline-command.sh         # the custom-command item
-  config.fragment.yaml          # tui.statusLine (items) + tui.customStatusLine (the command)
+README.md, AGENTS.md      this overview; rules for agents working in the repo
+harness-status-line/      component: status lines + analyzer (own README, AGENTS, docs/)
+ade/
+  herdr/                  component: Herdr mods + layout (own README)
+pyproject.toml, uv.lock   dev environment only: the akmon pin, nothing to build
+_aitna/                   dev layer: the project's own backlog/agents/memory + .akmon/ (materialized guardrails)
 ```
 
-To continue the work (agents included) see [AGENTS.md](AGENTS.md) and [docs/](docs/), first of all [docs/requirements.md](docs/requirements.md) (requirements, the `work`/`burn` terms, the calculation model).
+## akmon (the dev layer)
 
-## Usage
+akmon is installed as a package from its git repository, pinned to a release in `pyproject.toml`
+(`akmon @ git+https://github.com/akumidv/ai_akmon@v0.4.0`), mount mode `package`. Its files are in
+`.venv`; `.venv/bin/akmon path` prints where. The generated hook wiring calls `.venv/bin/akmon`, so
+`uv sync` has to have run. Check: `.venv/bin/akmon sync --check && .venv/bin/akmon verify --strict`.
+
+To work against a local checkout instead of the pin (the files are then a git working copy), on this machine only:
 
 ```bash
-python3 harness_status_line.py status                  # live configs vs repository
-python3 harness_status_line.py extract [--dry-run]     # live configs -> repository
-python3 harness_status_line.py deploy  [--dry-run]     # repository -> live configs
-python3 harness_status_line.py deploy --only claude codex-personal
+uv pip install -e ../akmon     # ~/workspace/akmon laid over the pin; `akmon path` now shows the checkout
+uv sync                        # back to the pin (uv run and uv sync always do this)
 ```
 
-- `--only` accepts a harness (`claude`, `qwen`, `codex`, `mcode`) or a profile (`codex-personal`).
-- `deploy` **merges** fragments into existing configs: foreign keys are untouched. A `*.bak-hsl-<time>` copy is made before any edit. `--dry-run` shows the diff and writes nothing. A repeated `deploy` changes nothing.
-- The `settings.json` format is normalized on merge (2-space indent); the original is kept in the backup.
-- **Secret protection:** `extract` refuses to put anything that looks like `api_key`/`token`/`secret`/`password` into the repository and takes only the blocks listed above from the configs.
-- `HSL_HOME=/path` runs everything relative to another home directory (for a risk-free check).
+A checkout that is ahead of the pinned release generates different pointer files, so `sync --check` and
+`verify` report them as stale until `akmon sync` is run (or the checkout sits on the pinned release).
+Bump the pin: change the version in `pyproject.toml`, `uv lock --upgrade-package akmon && uv sync`,
+then `.venv/bin/akmon init --mode package`.
 
-Requirements: Python 3.11+. For the Claude/Qwen status line — `bash` ≥ 4.2, `jq`, `awk`; for the analyzer — `python3`.
+Agents (and people continuing the work): read [AGENTS.md](AGENTS.md), then the component's own README / AGENTS.
 
-## Claude Code status line
-
-```
-Opus 5.5 medium · ctx 270K/1M ◷ 59m · ◆1× 4h53m 1.2× ▸1.1× 143 [140] · 5h 31%↑ 1h23m · wk 5%↑ 6d19h [→81%] · main · ~/proj
-```
-
-| Segment | Meaning |
-|---|---|
-| `ctx 270K/1M` | tokens in context / window size |
-| `◷ 59m` | how long the prompt cache still lives (TTL 5 min or 1 h, per session) |
-| `◆1× 4h53m 1.2× ▸1.1× 143 [140]` | three groups. **burn**: limit mode icon (`❄` eco / `◆` normal / `🔥` peak) + limit burn speed in the mode (normal = 1, `~` preliminary) + time to the **next** mode (its color, dimmed) · **`work`**: your pace relative to your own average · **speed**: endpoint load icon (`🐌` answers slower than usual / yellow `▸` normal / `🐇` faster, all sessions over 15 min) + `spd×` (orange slower, green faster, `~` expected from the matrix) + tokens/s over the last 5 min [whole session] (`–` — no replies in 5 min) |
-| `5h 31%↑ 1h23m` | 5-hour limit and time to reset |
-| `wk 5%↑ 6d19h [→81%]` | weekly limit, time to reset, **[forecast]**: `→81%` — usage at reset time; red time — when the limit runs out before the reset |
-
-**Modes** (UTC, an assumed schedule, not official Anthropic data): `🔥` peak — weekdays 13–19; `❄` eco — weekends and weekdays before 08:00; `◆` normal — the rest. The boundaries are the `PEAK_*`/`ECO_END` constants at the top of the script.
-
-**Two separate numbers after the mode icon** — `work` and `burn`; there is no combined value, so you can steer your work: **work more while the limit burns slowly (`burn` < 1, green), and calmer while it burns fast (`burn` > 1, red)**.
-
-1. **`work` — your pace** relative to **your own average while working** (the mean weekly-limit use per **active** hour over 14 days, idle hours excluded — profile line 7): `>1` — you work harder than usual, `<1` — calmer. It is the actual weekly-limit usage over the **current hour and the two before it** (nothing older, and not before the weekly reset) ÷ that usual use × the burn speed of those hours. An "active hour" is an hour in which you had an assistant reply (an activity log on this machine); **inactive hours are skipped**. Just started — the pace of the current hour, the two previous ones are ignored; the second hour began — over two, the third is ignored; and so on up to three. **Computed proportionally, by seconds**, not whole hours: an hour in which work started at :50 counts as 10 minutes; the current hour counts as the minutes elapsed. The base `wk%` measurement is the last one at the window start or earlier. While activity is under 2 minutes, the week since reset is used. The limit arrives in whole percents, so a short window is noisy: a "pseudo-observation" of 1 % at pace 1 is added to the measurement to damp outliers (the cost: in the first minutes `work` is close to 1). `work` does not depend on the mode. Color: **below 0.75 — cyan** (noticeably calmer than usual); **orange** (a warning) — above 1.5, and while the limit burns fast (`burn` > 1.05) — above 1.25; in between — no color. Red is reserved for what is really critical: `burn` > 1.05 (peak) and a forecast that runs out before the reset.
-2. **`burn` — limit burn speed** in the current mode relative to normal (normal = 1). This is a **measurement**: the analyzer takes the history of `wk%`/`5h%` readings and the token cost from the transcripts. While data is scarce (<150 intervals, <14 days, <$100), a **preliminary** value is used: a strongly "shrunk toward 1" regression on what exists (≥8 intervals), within 0.6–1.6 and with a sanity constraint: eco not above 1, peak not below 1 (otherwise noise would draw a "cheap peak"); marked `~`. `burn` color: green below 0.95, red above 1.05, otherwise dim (for the preliminary value too). Today, for example, eco 0.97 / normal 1 / peak 1 — no visible differences yet. If no dependence on time of day is found, `burn` = 1.
-
-**Forecast `wk [..]`** = the sum over **all remaining hours until the reset**: your average load of that hour (matrix 1) × `work` × the burn speed of **that same hour** (matrix 2). The current mode is not used in the forecast — each hour has its own speed. This is "how many tokens will burn", compared with how much limit is left (in normalized units: remaining % divided by average speed 1). Only the remainder of the matrices is recomputed, not the whole week.
-
-Without a profile (the first day) `work` is the old pace relative to uniform limit spending (the worse of 5h and weekly), and `burn` is not shown.
-
-#### How the analyzer chooses modes (once a day)
-
-The purpose is to show **roughly** where the peak is, so heavy work is not planned for peak hours. High accuracy is not needed; what matters is (1) where the mode boundaries lie, (2) mode coefficients near 1 (eco < 1, peak > 1). It is most likely a dynamic quantity, so the analyzer **keeps adjusting to recent history** (the last 42 days), without fanaticism:
-
-- **The grid is the hour of the week (168 cells)**, three modes (eco / normal / peak) versus "no time dependence" (`flat`). More is not needed: the goal is to understand where the peak roughly is. Half-hour and finer grids were removed.
-- **Modes and hourly factors from the data** (from ≥8 intervals; the status line shows `~` until validated): the burn per $ of every hour of the day, weekday and weekend apart (ridge, ±1 h smoothing), relative to the typical hour. An hour ≥ 1.15 is peak 🔥, ≤ 0.85 eco ❄, else normal ◆; hours with < $10 of data around them keep the published schedule (13–19 UTC peak, weekends eco) and show no number. The status line reads the modes from line 5 and the hour's factor from line 8 of the profile.
-- **Mode coefficients** — ridge regression "percent rose by Δ at token cost $C over the week's slots"; shrunk toward 1, amplitude understated (caution).
-- **Choosing flat vs 3 modes** — cross-validation by days; 3 modes are accepted only if they beat `flat` by >5 % and themselves with shuffled slot labels (null).
-- Data for the 5h and weekly limits are taken together. Requirements: ≥150 intervals, ≥14 days, ≥$100 cost; otherwise preliminary coefficients (see above) and default boundaries.
-- Result: `profile.json` (`burn_factors`: grid, `schedule_utc` — the mode windows by day type and the hourly factors, CV errors, coefficients by hour) and profile lines 3–5.
-
-**Honestly about accuracy** (synthetic data with a known answer, 40 days): no false shifts on flat and standard history; a true +2 h shift was found with error ≤1 h; a −1 h shift went unnoticed (the method is cautious and misses small shifts). Readings accumulate faster thanks to recording on every whole-percent change.
-
-Pace and forecast are recomputed on every change of `5h%`/`wk%` and at least every 5 minutes (new active hours from the collector).
-
-**`[time to exhaustion]`** is computed in three ways, the best available:
-1. from the **token cost profile**: `statusline-analyze.py` reads transcripts once a day (read-only, incremental), weights tokens by model price and type (input/output/cache) into **hourly** slots of the week and calibrates "% of limit per dollar" against the current `wk%`. This gives **two matrices** (168 hours of the week), both recomputed daily: **1) your load** (how much % of the limit you usually spend in this hour at normal burn speed) and **2) limit burn speed** (the mode coefficient for the hour). The status line takes only the **remainder** of the matrices from the current hour to the reset and multiplies each hour by your pace: load × speed × pace; the sum is the forecast;
-2. from the 7-day pace in the reading history;
-3. from this week's average pace (marked `~`).
-
-Red — if the limit runs out before the reset, dim — if you make it. If you make it, the **forecast usage at reset time** `[→97%]` is shown (the remaining profile × your current pace); `∞` — only when there is no forecast or it is far away. The profile is a typical week (nights and weekends with almost no usage), so "7 % in 7 hours" does not mean "will burn out": pace is measured against how much you usually spend by this time of the week.
-
-**Pace window** — the last 3 active hours (details in the section on price above). Recomputed on every `wk%` change, at least every 5 minutes.
-
-### Token and model measurements
-
-`statusline-analyze.py` (once a day, ≈4 s), besides the profile, writes a 14-day summary to `~/.local/state/harness-status-line/api.anthropic.com/profile.json`: tokens by type (input / output / cache read / cache write), token and cost usage **by model** (cost share, output tokens per hour), **by mode** (eco / normal / peak, per wall-clock hour) and by UTC hour of day. Separately, once per completed day, it appends a line to `~/.local/state/harness-status-line/api.anthropic.com/measures.jsonl` (cost, tokens and per-model breakdown for the day + the last `wk%` reading) — this journal outlives the analysis window and accumulates history for future per-model calibration.
-
-### Recording without an open session (cron) and the stop on errors
-
-The limit axis is written only from the responses of the open CLI sessions (the status line); work in sessions without a status line (VS Code extension) leaves a gap in it, tokens are still collected from the transcripts. A poll of the account usage endpoint was tried (2026-11-13..14) and **removed on 2026-11-14**: it answered `403 Forbidden {"type":"forbidden","message":"Request not allowed"}` (Cloudflare) every time, a decision of the user. The status line starts `--collect` (the collector: activity of all sessions, `work`, `spd`) itself every ≥5 min while a session is open; to keep collecting with no session (night, closed terminal) add the same command to cron — it is the same code, safe to run in parallel with the status lines:
-
-```bash
-(crontab -l 2>/dev/null | grep -v statusline-analyze; echo '*/5 * * * * nice -n 19 timeout 60 /usr/bin/python3 -I $HOME/.local/share/harness-status-line/statusline-analyze.py --collect >/dev/null 2>&1') | crontab -
-```
-
-(WSL: the cron daemon is not started by default — `sudo service cron start`, or `[boot] command=service cron start` in `/etc/wsl.conf`.)
-
-- **Stops on crashes.** Three crashes of the collector in a row write `~/.local/state/harness-status-line/collect-stopped.lock` with the reason; the collector does not run, and the status lines do not start it, until you have understood the cause. **Look and resume:** `python3 -I ~/.local/share/harness-status-line/statusline-analyze.py --health` (state and reason); `--resume` (or deleting the stop file) after the cause is fixed.
-
-### How resources are saved
-
-- one `jq` per input, the rest is bash arithmetic (no `cat`/`printf` subprocesses);
-- the finished line is cached for 15 s per session (refresh bursts ≈ 1 ms);
-- the transcript is read incrementally (offset + accumulated state), not whole;
-- the runtime cache lives in **tmpfs** (`/tmp/claude-sl-$UID`, mode 700), durable data in `~/.claude`.
-
-| File | Where | Purpose |
-|---|---|---|
-| `/tmp/claude-sl-$UID/*` | RAM | caches of the line, transcript, git, mode, coefficient — safe to delete |
-| `~/.local/state/harness-status-line/api.anthropic.com/history` | disk | `wk%`/`5h%` reading (+ weekly and 5h reset times) on **every whole-percent change** + a pulse every 30 min; kept forever — the **limit axis**. Written only by CLI status lines (the headers of their own responses), so work in sessions without a status line (VS Code extension) leaves gaps (the usage-endpoint poll was removed 2026-11-14, it got `403`). A `wk%` lower than the last sample of the same week is not written: an idle session keeps passing the limits of its last response |
-| `~/.local/state/harness-status-line/api.anthropic.com/daily` | disk | 7-day pace, recomputed once a day (UTC) |
-| `~/.local/state/harness-status-line/api.anthropic.com/profile[.json]` | disk | line 2 — matrix 1 (load by 168 hours of the week, thousandths of a % of the limit); line 3 — coefficients `eco norm peak` (×100 or `-`); line 4 — matrix 2 (burn speed by 168 hours, ×100); line 5 — the mode of each of the 168 hours (0/1/2); line 6 — `fit`/`prelim`/`-` (how the coefficients were obtained); line 7 — base of `work`: thousandths of a % per active hour; line 8 — the hour's own burn factor ×100 (0 = no data); `.json` — summary |
-| `~/.local/state/harness-status-line/api.anthropic.com/tokens` | disk | the **token axis**: raw tokens per 5 min, model, reasoning effort and speed as **JSONL**, one JSON object per line, readable by hand (`t`/`ts` bucket start as epoch / UTC, `model`, `effort`, `speed`, `msgs`, `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`, `thinking`; `thinking` is part of `output`), no prices; kept forever. Old files are **rotated, not deleted**: when the format changes the original is renamed to `tokens.<epoch>` (the legacy whitespace format is still read and converted losslessly). Imported machines: `tokens@<host>`. Join with the history by epoch |
-| `~/.local/state/harness-status-line/imports/<host>/` | disk | **other machines** under the same account: copies of their `~/.claude/projects`, made by `~/.local/share/harness-status-line/hsl-import.sh <user@address | ssh alias>` (rsync of `*.jsonl` over ssh, the dir name = the parameter: `user@address` → `user_address`, an alias as is; then reruns the analyzer), read-only; their use counts as mine. Use not imported is detected as **outside use** (5h step far above the median 5h%-per-$ of local cost) and kept out of calibration and the mode fit — see `outside_use` in the profile JSON |
-| `~/.local/state/harness-status-line/api.anthropic.com/analyze-state.json` | disk | incremental analysis state |
-| `~/.local/state/harness-status-line/api.anthropic.com/measures.jsonl` | disk | daily journal: tokens and cost by model |
-
-Analyzer assumptions (in `profile.json`): prices come from the Anthropic table, but cache-write prices (1.25× / 2× of input) and Haiku 5.5 cache-read (0.1×) are **assumptions**; only the ratios matter, the absolute scale is calibrated against the real `wk%`. Transcripts see only this machine while the limit covers the whole account, so the estimate is more accurate the more work is done here.
-
-## Other harnesses
-
-Connections **without limits** (Qwen Code, mcode, pay-per-token, Claude via API key) have no burn group: `work×` (your token pace vs usual), then the speed group `🐌`/`▸`/`🐇` + `spd×` (how fast the models answer now vs their own median, all harnesses on that endpoint; `~` — expected from the matrix) + time to the next load mode + tokens/s [session], and today's usage `day Σ3.2M` / `day $1.23`. Activity for `work` comes from the logs of **all** sessions, including the VS Code extension where there is no status line. Details — [docs/connections.md](docs/connections.md).
-
-- **Qwen Code** — `ui.statusLine` (type `command`) and its own `statusline-command.sh`, adapted to the fields Qwen passes on stdin; 5 s execution limit, 2 lines. `1.5× 🐌.9× – [115] · day Σ528K · Σ 900K→12K · main`.
-- **Codex** — built-in status line: `[tui] status_line = [...]` (item identifiers) and `status_line_use_colors`. The `~/.codex` and `~/.codex-personal` profiles are extracted separately; for profiles without these keys `extract` creates nothing.
-- **mcode (MiniMax Code)** — `tui.statusLine` is a list of built-in items (setting it replaces the defaults, so the fragment lists them + `custom-command`); `tui.customStatusLine` runs `~/.minimax/statusline-command.sh` (no shell: `bash -c '…"$HOME"…'`). mcode passes no tokens on stdin, so the segment is built from the shared collector: `1.5× 🐌.9× · day Σ528K`. Format checked against the mcode 0.7.6 bundle.
+License: [MIT](LICENSE).

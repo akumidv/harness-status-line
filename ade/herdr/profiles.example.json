@@ -1,0 +1,8 @@
+{
+  "main": "main",
+  "profiles": [
+    {"name": "main",   "label": "MN", "color": "#3b6fd4"},
+    {"name": "work-a", "label": "WA", "color": "#2f9e6b", "theme": "moss"},
+    {"name": "work-b", "label": "WB", "color": "#7a5ad6", "theme": "ink"}
+  ]
+}

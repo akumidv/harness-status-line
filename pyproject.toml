@@ -1,0 +1,16 @@
+# Dev environment only: ai_env itself is plain scripts and has nothing to install or build.
+# The one dependency is the akmon dev layer (mount mode "package", _aitna/.akmon.toml), pinned to a
+# git tag until akmon is on PyPI. A local checkout can be laid over it, see README ("akmon").
+[project]
+name = "ai-env"
+version = "0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "akmon @ git+https://github.com/akumidv/ai_akmon@v0.4.0",
+]
+
+[tool.uv]
+package = false
